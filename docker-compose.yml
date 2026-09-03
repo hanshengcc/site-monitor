@@ -1,0 +1,40 @@
+version: "3.8"
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: site_monitor
+      POSTGRES_USER: monitor
+      POSTGRES_PASSWORD: monitor123
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U monitor -d site_monitor"]
+      interval: 5s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./screenshots:/app/screenshots
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://monitor:monitor123@db:5432/site_monitor
+      DATABASE_URL_SYNC: postgresql://monitor:monitor123@db:5432/site_monitor
+      SCREENSHOTS_DIR: /app/screenshots
+      PLAYWRIGHT_CONCURRENCY: "8"
+      CHECK_INTERVAL_MINUTES: "5"
+      SCREENSHOT_INTERVAL_MINUTES: "360"
+
+volumes:
+  pgdata:
