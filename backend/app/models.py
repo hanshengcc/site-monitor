@@ -136,5 +136,14 @@ class TargetStatus(Base):
     last_screenshot_at = Column(DateTime(timezone=True))
     has_anomaly = Column(Boolean, default=False)
     consecutive_fails = Column(Integer, default=0)
+    # SSL certificate info
+    ssl_valid = Column(Boolean)
+    ssl_error = Column(Text)
+    ssl_issuer = Column(Text)
+    ssl_subject = Column(Text)
+    ssl_not_after = Column(DateTime(timezone=True))
+    ssl_days_left = Column(Integer)
+    ssl_warning = Column(Text)
+    ssl_checked_at = Column(DateTime(timezone=True))
 
     target = relationship("Target", back_populates="status")

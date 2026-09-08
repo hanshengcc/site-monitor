@@ -52,6 +52,27 @@
             <el-descriptions-item label="连续失败">{{ target?.status?.consecutive_fails || 0 }}</el-descriptions-item>
             <el-descriptions-item label="错误">{{ target?.status?.last_error || '无' }}</el-descriptions-item>
             <el-descriptions-item label="检测时间">{{ formatTime(target?.status?.last_check_at) }}</el-descriptions-item>
+            <el-descriptions-item label="🔒 证书状态" v-if="target?.status?.ssl_checked_at">
+              <el-tag :type="target?.status?.ssl_valid ? 'success' : 'danger'" size="small">
+                {{ target?.status?.ssl_valid ? '正常' : '异常' }}
+              </el-tag>
+              <span v-if="target?.status?.ssl_days_left != null" style="margin-left: 8px; font-size: 12px"
+                :style="{ color: target?.status?.ssl_days_left <= 7 ? '#f56c6c' : target?.status?.ssl_days_left <= 30 ? '#e6a23c' : '#67c23a' }">
+                剩余 {{ target?.status?.ssl_days_left }} 天
+              </span>
+            </el-descriptions-item>
+            <el-descriptions-item label="证书签发者" v-if="target?.status?.ssl_issuer">
+              {{ target?.status?.ssl_issuer }}
+            </el-descriptions-item>
+            <el-descriptions-item label="证书过期" v-if="target?.status?.ssl_not_after">
+              {{ formatTime(target?.status?.ssl_not_after) }}
+            </el-descriptions-item>
+            <el-descriptions-item label="证书错误" v-if="target?.status?.ssl_error">
+              <span style="color: #f56c6c">{{ target?.status?.ssl_error }}</span>
+            </el-descriptions-item>
+            <el-descriptions-item label="证书警告" v-if="target?.status?.ssl_warning">
+              <span style="color: #e6a23c">{{ target?.status?.ssl_warning }}</span>
+            </el-descriptions-item>
           </el-descriptions>
         </el-card>
       </el-col>

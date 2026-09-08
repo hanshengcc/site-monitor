@@ -8,10 +8,43 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
+from sqlalchemy import select
 
 from backend.app.config import settings
+from backend.app.database import AsyncSessionLocal
+from backend.app.models import GlobalSetting
 from backend.app.scheduler import start_scheduler, stop_scheduler
 from backend.app.routers import targets, results, screenshots, alerts, dashboard, tasks, settings as settings_router
+
+
+async def load_settings_from_db():
+    """Load persisted global settings from DB into memory settings on startup."""
+    try:
+        async with AsyncSessionLocal() as session:
+            rows = await session.execute(select(GlobalSetting))
+            for r in rows.scalars().all():
+                val = r.value
+                if r.key == "check_interval":
+                    val_int = int(val) if str(val).isdigit() else 300
+                    settings.check_interval_minutes = max(1, val_int // 60) if val_int >= 60 else 1
+                elif r.key == "screenshot_interval":
+                    val_int = int(val) if str(val).isdigit() else 21600
+                    settings.screenshot_interval_minutes = max(1, val_int // 60) if val_int >= 60 else 1
+                elif r.key == "max_concurrent_checks":
+                    settings.max_concurrent_checks = int(val)
+                elif r.key == "playwright_concurrency":
+                    settings.playwright_concurrency = int(val)
+                elif r.key == "default_timeout":
+                    settings.check_timeout = int(val)
+                elif r.key == "consecutive_fails_threshold":
+                    settings.consecutive_fails_threshold = int(val)
+        logger.info(
+            f"Loaded settings from DB: check_interval={settings.check_interval_minutes}min, "
+            f"screenshot_interval={settings.screenshot_interval_minutes}min, "
+            f"max_concurrent={settings.max_concurrent_checks}"
+        )
+    except Exception as e:
+        logger.warning(f"Failed to load global settings from DB on startup: {e}")
 
 
 @asynccontextmanager
@@ -21,6 +54,9 @@ async def lifespan(app: FastAPI):
 
     # Ensure screenshots dir exists
     Path(settings.screenshots_dir).mkdir(parents=True, exist_ok=True)
+
+    # Load persistent settings from DB
+    await load_settings_from_db()
 
     # Start scheduler
     start_scheduler()

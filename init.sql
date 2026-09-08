@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS targets (
 
 CREATE INDEX idx_targets_enabled ON targets(enabled);
 CREATE INDEX idx_targets_group ON targets("group");
+CREATE UNIQUE INDEX IF NOT EXISTS idx_targets_url_unique ON targets(url);
 
 -- 检测结果 (按月分区)
 CREATE TABLE IF NOT EXISTS check_results (
@@ -132,5 +133,19 @@ CREATE TABLE IF NOT EXISTS target_status (
     last_screenshot_id BIGINT,
     last_screenshot_at TIMESTAMPTZ,
     has_anomaly     BOOLEAN DEFAULT FALSE,
-    consecutive_fails INTEGER DEFAULT 0
+    consecutive_fails INTEGER DEFAULT 0,
+    ssl_valid       BOOLEAN,
+    ssl_error       TEXT,
+    ssl_issuer      TEXT,
+    ssl_subject     TEXT,
+    ssl_not_after   TIMESTAMPTZ,
+    ssl_days_left   INTEGER,
+    ssl_warning     TEXT,
+    ssl_checked_at  TIMESTAMPTZ
 );
+
+CREATE INDEX IF NOT EXISTS idx_target_status_is_ok ON target_status(is_ok);
+CREATE INDEX IF NOT EXISTS idx_target_status_ssl_valid ON target_status(ssl_valid);
+CREATE INDEX IF NOT EXISTS idx_target_status_ssl_days_left ON target_status(ssl_days_left ASC NULLS LAST);
+CREATE INDEX IF NOT EXISTS idx_target_status_last_check_at ON target_status(last_check_at DESC NULLS LAST);
+CREATE INDEX IF NOT EXISTS idx_targets_enabled_group ON targets(enabled, "group");

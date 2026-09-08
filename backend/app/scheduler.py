@@ -1,11 +1,12 @@
 """Scheduler - manages periodic check and screenshot tasks."""
 import asyncio
+from datetime import datetime, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from loguru import logger
 
 from backend.app.config import settings
-from backend.app.checker import run_checks
+from backend.app.checker import run_checks, check_progress
 from backend.app.screenshoter import run_screenshots, close_browser
 from backend.app.alerter import dispatch_alerts
 
@@ -17,11 +18,12 @@ _shot_running = asyncio.Lock()
 
 
 async def _safe_run_checks():
-    if _check_running.locked():
-        logger.warning("Previous check round still running, skip.")
+    if _check_running.locked() or check_progress.get("running"):
+        logger.warning("Previous check round still running, skip auto check.")
         return
     async with _check_running:
         try:
+            logger.info("Auto-trigger: Starting scheduled HTTP checks...")
             await run_checks()
         except Exception as e:
             logger.exception(f"Check round failed: {e}")
@@ -50,13 +52,14 @@ async def _safe_run_screenshots():
 
 def start_scheduler():
     """Start the background scheduler."""
+    now = datetime.now(timezone.utc)
     scheduler.add_job(
         _safe_run_checks,
         trigger=IntervalTrigger(minutes=settings.check_interval_minutes),
         id="http_checks",
         name="HTTP Health Checks",
         replace_existing=True,
-        next_run_time=None,  # Don't run immediately; trigger manually first time
+        next_run_time=now,  # Trigger immediately on startup, then repeat every check_interval_minutes
     )
 
     scheduler.add_job(
@@ -65,12 +68,12 @@ def start_scheduler():
         id="screenshots",
         name="Page Screenshots",
         replace_existing=True,
-        next_run_time=None,
+        # Omit next_run_time so first screenshot round runs after screenshot_interval_minutes
     )
 
     scheduler.start()
     logger.info(
-        f"Scheduler started: checks every {settings.check_interval_minutes}min, "
+        f"Scheduler started: checks every {settings.check_interval_minutes}min (first run immediate), "
         f"screenshots every {settings.screenshot_interval_minutes}min"
     )
 

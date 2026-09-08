@@ -17,9 +17,15 @@
           <el-option label="健康" value="ok" /><el-option label="异常" value="fail" /><el-option label="未知" value="unknown" />
         </el-select>
       </el-col>
-      <el-col :span="12" style="text-align: right">
+      <el-col :span="3" v-if="filterGroup">
+        <el-button size="small" type="warning" plain @click="checkCurrentGroup">
+          <el-icon><Refresh /></el-icon> 检测该组
+        </el-button>
+      </el-col>
+      <el-col :span="filterGroup ? 9 : 12" style="text-align: right">
         <el-button type="primary" @click="showAdd = true"><el-icon><Plus /></el-icon> 添加</el-button>
         <el-button @click="showBatch = true"><el-icon><Upload /></el-icon> 批量导入</el-button>
+        <el-button type="success" @click="doExport"><el-icon><Download /></el-icon> 导出</el-button>
       </el-col>
     </el-row>
 
@@ -113,7 +119,7 @@
       </el-form>
       <template #footer>
         <el-button @click="showBatch = false">取消</el-button>
-        <el-button type="primary" @click="doBatchImport">导入</el-button>
+        <el-button type="primary" :loading="importing" @click="doBatchImport">导入</el-button>
       </template>
     </el-dialog>
   </div>
@@ -139,6 +145,7 @@ const addForm = ref({ url: '', name: '', group: 'default' })
 
 const showBatch = ref(false)
 const batchForm = ref({ text: '', group: 'default' })
+const importing = ref(false)
 const checkingId = ref(null)
 const shottingId = ref(null)
 
@@ -178,12 +185,38 @@ async function doAdd() {
 async function doBatchImport() {
   const urls = batchForm.value.text.split('\n').map(s => s.trim()).filter(Boolean)
   if (!urls.length) return ElMessage.warning('请输入URL')
-  const { data } = await api.batchCreate({ urls, group: batchForm.value.group })
-  ElMessage.success(`导入完成: 新增${data.created}, 跳过${data.skipped}`)
-  showBatch.value = false
-  batchForm.value = { text: '', group: 'default' }
-  loadData()
-  loadGroups()
+  importing.value = true
+  try {
+    const { data } = await api.batchCreate({ urls, group: batchForm.value.group })
+    ElMessage.success(`导入完成: 新增 ${data.created}, 跳过 ${data.skipped}`)
+    showBatch.value = false
+    batchForm.value = { text: '', group: 'default' }
+    loadData()
+    loadGroups()
+  } catch (e) {
+    ElMessage.error('导入失败: ' + (e.response?.data?.detail || e.message || '超时'))
+  } finally {
+    importing.value = false
+  }
+}
+
+async function checkCurrentGroup() {
+  if (!filterGroup.value) return
+  try {
+    await api.triggerCheckAll(filterGroup.value)
+    ElMessage.success(`已触发分组 [${filterGroup.value}] 检测`)
+  } catch (e) {
+    ElMessage.error('触发失败')
+  }
+}
+
+function doExport() {
+  const url = api.exportTargets({
+    search: search.value || undefined,
+    group: filterGroup.value || undefined,
+    status: filterStatus.value || undefined,
+  })
+  window.open(url, '_blank')
 }
 
 async function toggleTarget(row) {

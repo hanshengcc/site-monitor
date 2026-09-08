@@ -15,7 +15,7 @@ from backend.app.database import AsyncSessionLocal
 from backend.app.models import Target, CheckResult, TargetStatus
 
 # Realtime progress (read by /api/tasks/progress)
-check_progress = {"running": False, "total": 0, "done": 0, "ok": 0, "fail": 0}
+check_progress = {"running": False, "total": 0, "done": 0, "ok": 0, "fail": 0, "group": None}
 
 
 def _make_ssl_context() -> ssl.SSLContext:
@@ -62,6 +62,16 @@ async def check_single(
         request_timeout, follow_redirects, custom_headers,
     )
 
+    # ---- SSL certificate check (for HTTPS URLs that got HTTP 200) ----
+    if result["is_ok"] and url.startswith("https://"):
+        try:
+            from backend.app.ssl_checker import check_ssl_for_url
+            ssl_info = await check_ssl_for_url(url, timeout=10, warn_days=30)
+            if ssl_info:
+                result["ssl_info"] = ssl_info
+        except Exception as e:
+            logger.debug(f"[{target_id}] SSL cert check failed: {e}")
+
     # Auto-fallback: HTTPS SSL error → try HTTP
     if (
         not result["is_ok"]
@@ -83,6 +93,21 @@ async def check_single(
         else:
             # Both failed: keep original SSL error but note fallback attempted
             result["error"] = f"ssl_error (HTTP fallback also failed): {result['error']}"
+
+    # When HTTP check fails, run DNS-based domain status detection
+    # to distinguish "site down" from "domain expired/parked"
+    if not result["is_ok"]:
+        try:
+            from backend.app.domain_detector import detect_domain_status
+            verdict = await detect_domain_status(url, dns_timeout=5.0)
+            if verdict.is_parked_or_expired:
+                signals_str = "; ".join(s.detail for s in verdict.signals[:3])
+                result["error"] = f"域名过期/注册商处 [{verdict.category}] ({signals_str})"
+            elif verdict.is_dns_not_found:
+                signals_str = "; ".join(s.detail for s in verdict.signals[:3])
+                result["error"] = f"DNS无法解析 [{verdict.category}] ({signals_str})"
+        except Exception as e:
+            logger.debug(f"[{target_id}] Domain detection failed: {e}")
 
     return result
 
@@ -122,6 +147,18 @@ async def _do_check(
         if expect_keyword:
             if expect_keyword not in resp.text[:50000]:
                 result["error"] = f"keyword '{expect_keyword}' not found"
+                return result
+        # ---- Domain expired / parking detection (multi-signal) ----
+        from backend.app.domain_detector import detect_domain_status, check_content_signals
+        # Quick content check first (cheap); full DNS check only if content is suspicious
+        content_signal = check_content_signals(resp.text)
+        if content_signal:
+            # Content looks suspicious → do full multi-signal DNS check
+            verdict = await detect_domain_status(url, response_body=resp.text, dns_timeout=5.0)
+            if verdict.is_parked_or_expired:
+                result["is_ok"] = False
+                signals_str = "; ".join(s.detail for s in verdict.signals[:3])
+                result["error"] = f"域名过期/注册商处 [{verdict.category}] ({signals_str})"
                 return result
         result["is_ok"] = True
     except httpx.TimeoutException:
@@ -180,28 +217,58 @@ async def _flush_buffer(buffer: list):
     try:
         async with AsyncSessionLocal() as session:
             for r in buffer:
+                # Extract ssl_info before saving CheckResult (CheckResult doesn't have it)
+                ssl_info = r.pop("ssl_info", None)
+
                 session.add(CheckResult(**r))
-                stmt = insert(TargetStatus).values(
-                    target_id=r["target_id"],
-                    is_ok=r["is_ok"],
-                    last_check_at=r["checked_at"],
-                    last_status_code=r["status_code"],
-                    last_latency_ms=r["latency_ms"],
-                    last_error=r["error"],
-                    consecutive_fails=0 if r["is_ok"] else 1,
-                ).on_conflict_do_update(
+
+                # Build upsert values for target_status
+                upsert_vals = {
+                    "target_id": r["target_id"],
+                    "is_ok": r["is_ok"],
+                    "last_check_at": r["checked_at"],
+                    "last_status_code": r["status_code"],
+                    "last_latency_ms": r["latency_ms"],
+                    "last_error": r["error"],
+                    "consecutive_fails": 0 if r["is_ok"] else 1,
+                }
+                update_set = {
+                    "is_ok": r["is_ok"],
+                    "last_check_at": r["checked_at"],
+                    "last_status_code": r["status_code"],
+                    "last_latency_ms": r["latency_ms"],
+                    "last_error": r["error"],
+                    "consecutive_fails": (
+                        0 if r["is_ok"]
+                        else text("target_status.consecutive_fails + 1")
+                    ),
+                }
+
+                # Add SSL cert info if present
+                if ssl_info:
+                    ssl_not_after = None
+                    if ssl_info.get("ssl_not_after"):
+                        try:
+                            from datetime import datetime as _dt
+                            ssl_not_after = _dt.fromisoformat(ssl_info["ssl_not_after"])
+                        except (ValueError, TypeError):
+                            pass
+                    ssl_fields = {
+                        "ssl_valid": ssl_info.get("ssl_valid"),
+                        "ssl_error": ssl_info.get("ssl_error"),
+                        "ssl_issuer": ssl_info.get("ssl_issuer"),
+                        "ssl_subject": ssl_info.get("ssl_subject"),
+                        "ssl_not_after": ssl_not_after,
+                        "ssl_days_left": ssl_info.get("ssl_days_left"),
+                        "ssl_warning": ssl_info.get("ssl_warning"),
+                        "ssl_checked_at": r["checked_at"],
+                    }
+                    upsert_vals.update(ssl_fields)
+                    update_set.update(ssl_fields)
+
+                stmt = insert(TargetStatus).values(**upsert_vals).on_conflict_do_update(
                     index_elements=["target_id"],
-                    set_={
-                        "is_ok": r["is_ok"],
-                        "last_check_at": r["checked_at"],
-                        "last_status_code": r["status_code"],
-                        "last_latency_ms": r["latency_ms"],
-                        "last_error": r["error"],
-                        "consecutive_fails": (
-                            0 if r["is_ok"]
-                            else text("target_status.consecutive_fails + 1")
-                        ),
-                    },
+                    set_=update_set,
                 )
                 await session.execute(stmt)
             await session.commit()
@@ -228,23 +295,31 @@ async def _load_group_settings() -> dict:
         }
 
 
-async def run_checks():
+async def run_checks(group: Optional[str] = None):
     """Run HTTP checks with two-level concurrency:
     - Global semaphore: total max concurrent (e.g. 200)
     - Per-group semaphore: each group has its own limit (e.g. Taky=10, Danny=50)
+    If group is specified, only targets in that group are checked.
     """
-    logger.info("Starting HTTP check round...")
-    check_progress.update({"running": True, "total": 0, "done": 0, "ok": 0, "fail": 0})
+    if check_progress.get("running"):
+        logger.warning("Previous check round still running, skip.")
+        return
+
+    group_desc = f"group [{group}]" if group else "ALL groups"
+    logger.info(f"Starting HTTP check round for {group_desc}...")
+    check_progress.update({"running": True, "total": 0, "done": 0, "ok": 0, "fail": 0, "group": group})
 
     # Load targets
     async with AsyncSessionLocal() as session:
         stmt = select(Target).where(Target.enabled == True)
+        if group:
+            stmt = stmt.where(Target.group == group)
         rows = await session.execute(stmt)
         targets = rows.scalars().all()
 
     if not targets:
-        logger.info("No targets to check.")
-        check_progress.update({"running": False})
+        logger.info(f"No targets to check for {group_desc}.")
+        check_progress.update({"running": False, "group": group})
         return
 
     # Load group settings
@@ -262,7 +337,7 @@ async def run_checks():
                     f"timeout={gc.get('request_timeout', settings.check_timeout)}s")
 
     logger.info(f"Checking {total} targets (global max={max_concurrent})")
-    check_progress.update({"running": True, "total": total, "done": 0, "ok": 0, "fail": 0})
+    check_progress.update({"running": True, "total": total, "done": 0, "ok": 0, "fail": 0, "group": group})
 
     # Write queue
     write_queue = asyncio.Queue(maxsize=500)
@@ -332,6 +407,6 @@ async def run_checks():
 
     check_progress["running"] = False
     logger.info(
-        f"Check round done: {check_progress['ok']} ok, "
+        f"Check round done [{group_desc}]: {check_progress['ok']} ok, "
         f"{check_progress['fail']} failed out of {total}"
     )

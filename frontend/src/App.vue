@@ -40,6 +40,7 @@
           <!-- Progress bar -->
           <div v-if="progress.running || waitingStart" style="display: flex; align-items: center; gap: 8px; font-size: 13px; color: #666">
             <template v-if="progress.running">
+              <span v-if="progress.group" style="font-weight: 600; color: #409eff; font-size: 12px">[{{ progress.group }}]</span>
               <el-progress
                 :percentage="progressPct"
                 :stroke-width="16"
@@ -55,10 +56,29 @@
               <span>正在准备检测任务...</span>
             </template>
           </div>
-          <el-button size="small" @click="triggerCheckAll" :loading="checking" :disabled="progress.running || waitingStart">
-            <el-icon><Refresh /></el-icon>
-            {{ progress.running ? '检测中...' : waitingStart ? '准备中...' : '立即检测' }}
-          </el-button>
+
+          <!-- Group Selectable Check Button -->
+          <el-dropdown trigger="click" @command="handleCheckCommand" :disabled="progress.running || waitingStart">
+            <el-button size="small" type="primary" :loading="checking" :disabled="progress.running || waitingStart">
+              <el-icon><Refresh /></el-icon>
+              {{ progress.running ? (progress.group ? `检测中 [${progress.group}]...` : '全量检测中...') : waitingStart ? '准备中...' : '立即检测' }}
+              <el-icon class="el-icon--right"><ArrowDown /></el-icon>
+            </el-button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item command="__ALL__">
+                  <span style="font-weight: 600; color: #409eff">🌐 全量检测 (全部站点)</span>
+                </el-dropdown-item>
+                <el-dropdown-item divided disabled>
+                  <span style="font-size: 12px; color: #999">选择分组单独检测：</span>
+                </el-dropdown-item>
+                <el-dropdown-item v-for="g in groupList" :key="g.group" :command="g.group">
+                  📁 {{ g.group }} ({{ g.count }} 个站点)
+                </el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
+
           <el-button size="small" @click="triggerScreenshotAll" :loading="shotting">
             <el-icon><Camera /></el-icon> 立即截图
           </el-button>
@@ -74,12 +94,14 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { ElMessage } from 'element-plus'
+import { ArrowDown, Refresh, Camera, Loading, Monitor, DataBoard, Link, WarningFilled, Setting } from '@element-plus/icons-vue'
 import api from './api/index.js'
 
 const checking = ref(false)
 const shotting = ref(false)
 const waitingStart = ref(false)
-const progress = ref({ running: false, total: 0, done: 0, ok: 0, fail: 0 })
+const progress = ref({ running: false, total: 0, done: 0, ok: 0, fail: 0, group: null })
+const groupList = ref([])
 let progressTimer = null
 let pollCount = 0
 
@@ -88,32 +110,36 @@ const progressPct = computed(() => {
   return Math.round(progress.value.done / progress.value.total * 100)
 })
 
+async function loadGroups() {
+  try {
+    const { data } = await api.getGroups()
+    groupList.value = data || []
+  } catch (e) {}
+}
+
 async function pollProgress() {
   try {
     const { data } = await api.getCheckProgress()
     progress.value = data
 
     if (data.running) {
-      // Task is running, clear waiting state
       waitingStart.value = false
       pollCount = 0
     } else if (waitingStart.value) {
-      // Task hasn't started yet, keep waiting (up to 30s)
       pollCount++
       if (pollCount > 15) {
-        // Gave up waiting
         stopPolling()
         waitingStart.value = false
         checking.value = false
         ElMessage.warning('检测任务启动超时，请重试')
       }
     } else if (data.total > 0) {
-      // Task finished (was running, now stopped, has results)
       stopPolling()
       checking.value = false
-      ElMessage.success(`检测完成: ${data.ok} 正常, ${data.fail} 失败 (共${data.total})`)
+      const prefix = data.group ? `[${data.group}] ` : ''
+      ElMessage.success(`${prefix}检测完成: ${data.ok} 正常, ${data.fail} 失败 (共${data.total})`)
+      loadGroups()
     } else {
-      // Idle, nothing happening
       stopPolling()
       checking.value = false
     }
@@ -133,12 +159,18 @@ function stopPolling() {
   }
 }
 
-async function triggerCheckAll() {
+async function handleCheckCommand(cmd) {
+  const group = cmd === '__ALL__' ? null : cmd
+  await runCheck(group)
+}
+
+async function runCheck(group = null) {
   checking.value = true
   waitingStart.value = true
   try {
-    await api.triggerCheckAll()
-    ElMessage.info('全量检测已启动，状态实时更新中...')
+    await api.triggerCheckAll(group)
+    const label = group ? `分组 [${group}]` : '全量'
+    ElMessage.info(`${label} 检测任务已启动，状态实时更新中...`)
     startPolling()
   } catch (e) {
     ElMessage.error('触发失败')
@@ -159,6 +191,7 @@ async function triggerScreenshotAll() {
 }
 
 onMounted(async () => {
+  loadGroups()
   try {
     const { data } = await api.getCheckProgress()
     progress.value = data

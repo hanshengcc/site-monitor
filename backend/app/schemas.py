@@ -51,6 +51,15 @@ class TargetStatusOut(BaseModel):
     last_screenshot_at: Optional[datetime] = None
     has_anomaly: bool = False
     consecutive_fails: int = 0
+    # SSL certificate
+    ssl_valid: Optional[bool] = None
+    ssl_error: Optional[str] = None
+    ssl_issuer: Optional[str] = None
+    ssl_subject: Optional[str] = None
+    ssl_not_after: Optional[datetime] = None
+    ssl_days_left: Optional[int] = None
+    ssl_warning: Optional[str] = None
+    ssl_checked_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
