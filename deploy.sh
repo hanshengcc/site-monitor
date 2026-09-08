@@ -1,17 +1,19 @@
 #!/bin/bash
 set -e
 
+# Ensure full PATH for cron
+export PATH="/root/site-monitor/venv/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+
 PROJECT_DIR="/root/site-monitor"
 cd "$PROJECT_DIR"
 
 # 1. Fetch remote changes
-git fetch origin main
+git fetch origin main >/dev/null 2>&1
 
 LOCAL=$(git rev-parse HEAD)
 REMOTE=$(git rev-parse origin/main)
 
 if [ "$LOCAL" = "$REMOTE" ]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Already up to date."
     exit 0
 fi
 
