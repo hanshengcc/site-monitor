@@ -13,3 +13,5 @@ numpy==2.2.6
 python-multipart==0.0.20
 aiofiles==24.1.0
 loguru==0.7.3
+dnspython==2.7.0
+cryptography==44.0.2

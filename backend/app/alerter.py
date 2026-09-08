@@ -72,8 +72,21 @@ def format_alert_message(target: Target, anomaly: Anomaly) -> tuple[str, str]:
     return title, text
 
 
+def format_recovery_message(target: Target, anomaly: Anomaly) -> tuple[str, str]:
+    """Format recovery notification title and body."""
+    title = f"✅ 站点已恢复: {target.name or target.url}"
+    text = (
+        f"**站点**: {target.name or ''} ({target.url})\n"
+        f"**分组**: {target.group}\n"
+        f"**状态**: 站点已重新恢复正常访问\n"
+        f"**之前异常**: {anomaly.anomaly_type}\n"
+        f"**恢复时间**: {anomaly.resolved_at or '刚刚'}\n"
+    )
+    return title, text
+
+
 async def dispatch_alerts():
-    """Find un-notified anomalies and send alerts through all enabled channels."""
+    """Find un-notified anomalies (both open alerts and recovery alerts) and send notifications."""
     async with AsyncSessionLocal() as session:
         # Get enabled channels
         ch_rows = await session.execute(
@@ -83,10 +96,10 @@ async def dispatch_alerts():
         if not channels:
             return
 
-        # Get un-notified open anomalies
+        # Get un-notified anomalies (both newly opened and newly resolved)
         stmt = (
             select(Anomaly)
-            .where(Anomaly.state == "open", Anomaly.notified == False)
+            .where(Anomaly.notified == False)
             .order_by(Anomaly.detected_at.desc())
             .limit(100)
         )
@@ -103,9 +116,13 @@ async def dispatch_alerts():
         for anomaly in anomalies:
             target = target_map.get(anomaly.target_id)
             if not target:
+                anomaly.notified = True
                 continue
 
-            title, text = format_alert_message(target, anomaly)
+            if anomaly.state == "resolved":
+                title, text = format_recovery_message(target, anomaly)
+            else:
+                title, text = format_alert_message(target, anomaly)
 
             for ch in channels:
                 try:
@@ -115,6 +132,7 @@ async def dispatch_alerts():
                             "target_url": target.url,
                             "anomaly_type": anomaly.anomaly_type,
                             "score": anomaly.score,
+                            "state": anomaly.state,
                         })
                     elif ch.channel_type == "dingtalk":
                         await send_dingtalk(ch.config["url"], title, text)
@@ -134,4 +152,4 @@ async def dispatch_alerts():
             anomaly.notified = True
 
         await session.commit()
-        logger.info(f"Dispatched alerts for {len(anomalies)} anomalies")
+        logger.info(f"Dispatched alerts/recoveries for {len(anomalies)} anomalies")

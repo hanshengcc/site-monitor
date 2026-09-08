@@ -1,10 +1,13 @@
-"""SQLAlchemy ORM models."""
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy import (
     Column, Integer, BigInteger, SmallInteger, String, Text, Boolean,
     Float, DateTime, ForeignKey, ARRAY, JSON, Index
 )
 from sqlalchemy.orm import DeclarativeBase, relationship
+
+
+def utc_now():
+    return datetime.now(timezone.utc)
 
 
 class Base(DeclarativeBase):
@@ -30,8 +33,8 @@ class Target(Base):
     verify_ssl = Column(Boolean, default=False)
     request_headers = Column(JSON, default={})
     enabled = Column(Boolean, default=True)
-    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
-    updated_at = Column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=utc_now)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
     status = relationship("TargetStatus", uselist=False, back_populates="target", lazy="joined", cascade="all, delete-orphan", passive_deletes=True)
 
@@ -52,7 +55,7 @@ class GroupSetting(Base):
     user_agent = Column(Text)
     enabled = Column(Boolean, default=True)
     note = Column(Text)
-    updated_at = Column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
 
 class CheckResult(Base):
@@ -60,7 +63,7 @@ class CheckResult(Base):
 
     id = Column(BigInteger, autoincrement=True, primary_key=True)
     target_id = Column(Integer, nullable=False)
-    checked_at = Column(DateTime(timezone=True), primary_key=True, default=datetime.utcnow)
+    checked_at = Column(DateTime(timezone=True), primary_key=True, default=utc_now)
     status_code = Column(SmallInteger)
     latency_ms = Column(Integer)
     is_ok = Column(Boolean, default=False)
@@ -72,7 +75,7 @@ class Screenshot(Base):
 
     id = Column(BigInteger, primary_key=True)
     target_id = Column(Integer, ForeignKey("targets.id", ondelete="CASCADE"), nullable=False)
-    taken_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+    taken_at = Column(DateTime(timezone=True), default=utc_now)
     file_path = Column(Text, nullable=False)
     thumb_path = Column(Text)
     file_size = Column(Integer)
@@ -93,7 +96,7 @@ class Baseline(Base):
     id = Column(Integer, primary_key=True)
     target_id = Column(Integer, ForeignKey("targets.id", ondelete="CASCADE"), nullable=False, unique=True)
     screenshot_id = Column(BigInteger, ForeignKey("screenshots.id", ondelete="CASCADE"), nullable=False)
-    set_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+    set_at = Column(DateTime(timezone=True), default=utc_now)
     set_by = Column(Text, default="auto")
 
 
@@ -102,7 +105,7 @@ class Anomaly(Base):
 
     id = Column(BigInteger, primary_key=True)
     target_id = Column(Integer, ForeignKey("targets.id", ondelete="CASCADE"), nullable=False)
-    detected_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+    detected_at = Column(DateTime(timezone=True), default=utc_now)
     anomaly_type = Column(Text, nullable=False)
     score = Column(Float, default=0)
     reasons = Column(JSON, default=[])
@@ -120,7 +123,7 @@ class AlertChannel(Base):
     channel_type = Column(Text, nullable=False)
     config = Column(JSON, nullable=False)
     enabled = Column(Boolean, default=True)
-    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=utc_now)
 
 
 class TargetStatus(Base):

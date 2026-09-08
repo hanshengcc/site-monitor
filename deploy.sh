@@ -1,11 +1,11 @@
 #!/bin/bash
 set -e
 
-# Ensure full PATH for cron
-export PATH="/root/site-monitor/venv/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
-
-PROJECT_DIR="/root/site-monitor"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_DIR"
+
+# Ensure full PATH including project venv
+export PATH="$PROJECT_DIR/venv/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
 # 1. Fetch remote changes
 git fetch origin main >/dev/null 2>&1
@@ -30,6 +30,16 @@ if echo "$DIFF_FILES" | grep -q "requirements.txt"; then
     echo "Updating Python dependencies..."
     source venv/bin/activate
     pip install -r requirements.txt -q
+fi
+
+# Apply DB schema changes if init.sql changed
+if echo "$DIFF_FILES" | grep -q "init.sql"; then
+    echo "Applying database updates from init.sql..."
+    if docker ps 2>/dev/null | grep -q "site-monitor-db"; then
+        docker exec -i site-monitor-db psql -U monitor -d site_monitor < init.sql 2>&1 || true
+    elif command -v psql >/dev/null 2>&1; then
+        PGPASSWORD=monitor123 psql -h localhost -U monitor -d site_monitor < init.sql 2>&1 || true
+    fi
 fi
 
 # Rebuild frontend if frontend files changed

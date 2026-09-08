@@ -12,7 +12,7 @@ from sqlalchemy.dialects.postgresql import insert
 
 from backend.app.config import settings
 from backend.app.database import AsyncSessionLocal
-from backend.app.models import Target, CheckResult, TargetStatus
+from backend.app.models import Target, CheckResult, TargetStatus, Anomaly
 
 # Realtime progress (read by /api/tasks/progress)
 check_progress = {"running": False, "total": 0, "done": 0, "ok": 0, "fail": 0, "group": None}
@@ -269,8 +269,48 @@ async def _flush_buffer(buffer: list):
                 stmt = insert(TargetStatus).values(**upsert_vals).on_conflict_do_update(
                     index_elements=["target_id"],
                     set_=update_set,
-                )
-                await session.execute(stmt)
+                ).returning(TargetStatus.consecutive_fails)
+                res = await session.execute(stmt)
+                row = res.fetchone()
+                curr_fails = row[0] if row else (0 if r["is_ok"] else 1)
+
+                if not r["is_ok"]:
+                    if curr_fails >= settings.consecutive_fails_threshold:
+                        # Check if there's already an open http_error anomaly
+                        existing = await session.execute(
+                            select(Anomaly).where(
+                                Anomaly.target_id == r["target_id"],
+                                Anomaly.anomaly_type == "http_error",
+                                Anomaly.state == "open",
+                            )
+                        )
+                        if not existing.scalar_one_or_none():
+                            err_desc = r.get("error") or f"HTTP {r.get('status_code')}"
+                            anomaly = Anomaly(
+                                target_id=r["target_id"],
+                                detected_at=r["checked_at"],
+                                anomaly_type="http_error",
+                                score=min(100.0, 30.0 + curr_fails * 10),
+                                reasons=[{"rule": "consecutive_fails", "detail": f"连续失败 {curr_fails} 次: {err_desc}"}],
+                                state="open",
+                                notified=False,
+                            )
+                            session.add(anomaly)
+                else:
+                    # Auto-resolve previously open anomalies for this target
+                    open_anomalies = await session.execute(
+                        select(Anomaly).where(
+                            Anomaly.target_id == r["target_id"],
+                            Anomaly.state == "open",
+                        )
+                    )
+                    for oa in open_anomalies.scalars().all():
+                        was_notified = oa.notified
+                        oa.state = "resolved"
+                        oa.resolved_at = r["checked_at"]
+                        # If previously alerted, notify about recovery; otherwise stay quiet
+                        oa.notified = False if was_notified else True
+
             await session.commit()
     except Exception as e:
         logger.error(f"DB flush failed for {len(buffer)} results: {e}")
@@ -399,8 +439,11 @@ async def run_checks(group: Optional[str] = None):
             max_keepalive_connections=50,
         ),
     ) as client:
-        tasks = [check_and_enqueue(t) for t in targets]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        chunk_size = max(500, max_concurrent * 2)
+        for i in range(0, total, chunk_size):
+            chunk = targets[i:i + chunk_size]
+            tasks = [check_and_enqueue(t) for t in chunk]
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     await write_queue.put(None)
     await writer_task

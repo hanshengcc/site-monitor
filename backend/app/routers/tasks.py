@@ -7,7 +7,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.database import get_db, AsyncSessionLocal
-from backend.app.models import Target, CheckResult, TargetStatus
+from backend.app.models import Target, CheckResult, TargetStatus, Anomaly
 from backend.app.checker import run_checks, check_single, check_progress
 from backend.app.screenshoter import run_screenshots
 
@@ -178,6 +178,38 @@ async def trigger_single_screenshot(target_id: int, db: AsyncSession = Depends(g
     db.add(shot)
     await db.flush()
 
+    if analysis["is_anomaly"]:
+        existing = await db.execute(
+            select(Anomaly).where(
+                Anomaly.target_id == target.id,
+                Anomaly.anomaly_type == "render_anomaly",
+                Anomaly.state == "open",
+            )
+        )
+        if not existing.scalar_one_or_none():
+            anomaly = Anomaly(
+                target_id=target.id,
+                detected_at=result["taken_at"],
+                anomaly_type="render_anomaly",
+                score=analysis["score"],
+                reasons=analysis["reasons"],
+                screenshot_id=shot.id,
+                state="open",
+                notified=False,
+            )
+            db.add(anomaly)
+    else:
+        open_anomalies = await db.execute(
+            select(Anomaly).where(
+                Anomaly.target_id == target.id,
+                Anomaly.anomaly_type == "render_anomaly",
+                Anomaly.state == "open",
+            )
+        )
+        for oa in open_anomalies.scalars().all():
+            oa.state = "resolved"
+            oa.resolved_at = result["taken_at"]
+
     upsert = insert(TargetStatus).values(
         target_id=target.id,
         last_screenshot_id=shot.id,
@@ -334,12 +366,19 @@ async def _run_retry_failed(group: str = None):
         verify=_make_ssl_context(),
         limits=httpx.Limits(max_connections=max_concurrent, max_keepalive_connections=50),
     ) as client:
-        tasks = [check_one(t) for t in targets]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        chunk_size = max(500, max_concurrent * 2)
+        for i in range(0, total, chunk_size):
+            chunk = targets[i:i + chunk_size]
+            tasks = [check_one(t) for t in chunk]
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if len(buffer) >= 200:
+                await _flush_buffer(buffer)
+                buffer.clear()
 
-    # Flush results to DB
+    # Flush remaining results to DB
     if buffer:
         await _flush_buffer(buffer)
+        buffer.clear()
 
     retry_progress["running"] = False
     logger.info(

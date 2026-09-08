@@ -1,5 +1,24 @@
 <template>
   <div>
+    <!-- Top Action Bar -->
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px">
+      <div style="font-size: 16px; font-weight: 600; color: #303133">
+        🖥️ 实时健康监控
+      </div>
+      <div style="display: flex; align-items: center; gap: 10px">
+        <span style="font-size: 12px; color: #909399">自动刷新:</span>
+        <el-radio-group v-model="autoRefreshInterval" size="small" @change="setupAutoRefresh">
+          <el-radio-button :value="0">关闭</el-radio-button>
+          <el-radio-button :value="15">15秒</el-radio-button>
+          <el-radio-button :value="30">30秒</el-radio-button>
+          <el-radio-button :value="60">60秒</el-radio-button>
+        </el-radio-group>
+        <el-button size="small" type="primary" plain :loading="refreshing" @click="manualRefresh">
+          <el-icon><Refresh /></el-icon> 刷新
+        </el-button>
+      </div>
+    </div>
+
     <!-- Stats Cards -->
     <el-row :gutter="16" style="margin-bottom: 20px">
       <el-col :span="4" v-for="card in cards" :key="card.label">
@@ -288,8 +307,39 @@ const failures = ref([])
 const failureGroup = ref('')
 const selectedErrorTypes = ref([])
 const retrying = ref(false)
+const refreshing = ref(false)
 const retryInfo = ref({ total: 0, done: 0, ok: 0, fail: 0, skipped_expired: 0 })
 let retryTimer = null
+
+// ---- Auto Refresh ----
+const autoRefreshInterval = ref(0)
+let autoRefreshTimer = null
+
+function setupAutoRefresh() {
+  if (autoRefreshTimer) {
+    clearInterval(autoRefreshTimer)
+    autoRefreshTimer = null
+  }
+  if (autoRefreshInterval.value > 0) {
+    autoRefreshTimer = setInterval(() => {
+      if (!retrying.value) {
+        refreshAll()
+      }
+    }, autoRefreshInterval.value * 1000)
+  }
+}
+
+async function manualRefresh() {
+  refreshing.value = true
+  try {
+    await refreshAll()
+    ElMessage.success('已刷新')
+  } catch (e) {
+    ElMessage.error('刷新失败')
+  } finally {
+    refreshing.value = false
+  }
+}
 
 // ---- SSL data ----
 const sslSummaryData = ref({ total: 0, valid: 0, invalid: 0, expiring: 0, noHttps: 0, unchecked: 0 })
@@ -527,6 +577,10 @@ onUnmounted(() => {
   if (retryTimer) {
     clearInterval(retryTimer)
     retryTimer = null
+  }
+  if (autoRefreshTimer) {
+    clearInterval(autoRefreshTimer)
+    autoRefreshTimer = null
   }
 })
 </script>

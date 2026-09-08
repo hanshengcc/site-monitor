@@ -13,17 +13,24 @@ from sqlalchemy.dialects.postgresql import insert
 
 from backend.app.config import settings
 from backend.app.database import AsyncSessionLocal
-from backend.app.models import Target, Screenshot, TargetStatus
+from backend.app.models import Target, Screenshot, TargetStatus, Anomaly
 from backend.app.analyzer import analyze_screenshot
 
 
 _browser: Optional[Browser] = None
 _playwright = None
+_render_count: int = 0
+_MAX_RENDERS_BEFORE_RECYCLE: int = 500
 
 
 async def get_browser() -> Browser:
-    """Get or create a shared browser instance."""
-    global _browser, _playwright
+    """Get or create a shared browser instance with automatic recycling."""
+    global _browser, _playwright, _render_count
+    if _browser is not None and _render_count >= _MAX_RENDERS_BEFORE_RECYCLE:
+        logger.info(f"Recycling browser after {_render_count} screenshots to free memory...")
+        await close_browser()
+        _render_count = 0
+
     if _browser is None or not _browser.is_connected():
         _playwright = await async_playwright().start()
         _browser = await _playwright.chromium.launch(
@@ -34,6 +41,7 @@ async def get_browser() -> Browser:
                 "--disable-extensions",
             ]
         )
+        _render_count = 0
         logger.info("Browser launched")
     return _browser
 
@@ -138,6 +146,9 @@ async def take_screenshot(target_id: int, url: str) -> Optional[dict]:
         rel_path = str(filepath.relative_to(screenshots_dir))
         rel_thumb = str(thumb_filepath.relative_to(screenshots_dir))
 
+        global _render_count
+        _render_count += 1
+
         return {
             "target_id": target_id,
             "taken_at": now,
@@ -214,6 +225,42 @@ async def run_screenshots():
             shot = Screenshot(**r)
             session.add(shot)
             await session.flush()
+
+            # Record or resolve Anomaly
+            if analysis["is_anomaly"]:
+                existing = await session.execute(
+                    select(Anomaly).where(
+                        Anomaly.target_id == r["target_id"],
+                        Anomaly.anomaly_type == "render_anomaly",
+                        Anomaly.state == "open",
+                    )
+                )
+                if not existing.scalar_one_or_none():
+                    anomaly = Anomaly(
+                        target_id=r["target_id"],
+                        detected_at=r["taken_at"],
+                        anomaly_type="render_anomaly",
+                        score=analysis["score"],
+                        reasons=analysis["reasons"],
+                        screenshot_id=shot.id,
+                        state="open",
+                        notified=False,
+                    )
+                    session.add(anomaly)
+            else:
+                # Auto-resolve previously open render anomalies if page is now normal
+                open_anomalies = await session.execute(
+                    select(Anomaly).where(
+                        Anomaly.target_id == r["target_id"],
+                        Anomaly.anomaly_type == "render_anomaly",
+                        Anomaly.state == "open",
+                    )
+                )
+                for oa in open_anomalies.scalars().all():
+                    was_notified = oa.notified
+                    oa.state = "resolved"
+                    oa.resolved_at = r["taken_at"]
+                    oa.notified = False if was_notified else True
 
             # Update target_status with latest screenshot
             stmt = insert(TargetStatus).values(

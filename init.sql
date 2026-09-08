@@ -13,10 +13,24 @@ CREATE TABLE IF NOT EXISTS targets (
     shot_interval   INTEGER DEFAULT 21600,      -- 截图间隔(秒) 默认6h
     expect_status   SMALLINT DEFAULT 200,
     expect_keyword  TEXT,
+    protocol        TEXT DEFAULT 'https',
+    user_agent      TEXT,
+    request_timeout INTEGER DEFAULT 15,
+    follow_redirects BOOLEAN DEFAULT TRUE,
+    verify_ssl      BOOLEAN DEFAULT FALSE,
+    request_headers JSONB DEFAULT '{}',
     enabled         BOOLEAN DEFAULT TRUE,
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     updated_at      TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- 兼容老数据库字段迁移
+ALTER TABLE targets ADD COLUMN IF NOT EXISTS protocol TEXT DEFAULT 'https';
+ALTER TABLE targets ADD COLUMN IF NOT EXISTS user_agent TEXT;
+ALTER TABLE targets ADD COLUMN IF NOT EXISTS request_timeout INTEGER DEFAULT 15;
+ALTER TABLE targets ADD COLUMN IF NOT EXISTS follow_redirects BOOLEAN DEFAULT TRUE;
+ALTER TABLE targets ADD COLUMN IF NOT EXISTS verify_ssl BOOLEAN DEFAULT FALSE;
+ALTER TABLE targets ADD COLUMN IF NOT EXISTS request_headers JSONB DEFAULT '{}';
 
 CREATE INDEX idx_targets_enabled ON targets(enabled);
 CREATE INDEX idx_targets_group ON targets("group");
@@ -149,3 +163,20 @@ CREATE INDEX IF NOT EXISTS idx_target_status_ssl_valid ON target_status(ssl_vali
 CREATE INDEX IF NOT EXISTS idx_target_status_ssl_days_left ON target_status(ssl_days_left ASC NULLS LAST);
 CREATE INDEX IF NOT EXISTS idx_target_status_last_check_at ON target_status(last_check_at DESC NULLS LAST);
 CREATE INDEX IF NOT EXISTS idx_targets_enabled_group ON targets(enabled, "group");
+
+-- 全局系统设置
+CREATE TABLE IF NOT EXISTS global_settings (
+    key             TEXT PRIMARY KEY,
+    value           JSONB NOT NULL
+);
+
+-- 分组并发与请求配置策略
+CREATE TABLE IF NOT EXISTS group_settings (
+    group_name      TEXT PRIMARY KEY,
+    max_concurrency INTEGER DEFAULT 10,
+    request_timeout INTEGER DEFAULT 15,
+    user_agent      TEXT,
+    enabled         BOOLEAN DEFAULT TRUE,
+    note            TEXT,
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);

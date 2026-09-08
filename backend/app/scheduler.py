@@ -50,6 +50,84 @@ async def _safe_run_screenshots():
         logger.exception(f"Alert dispatch failed: {e}")
 
 
+async def run_daily_maintenance():
+    """Daily maintenance:
+    1. Ensure future monthly partitions exist.
+    2. Clean up old check results (>30 days).
+    3. Clean up old normal screenshots (>14 days, preserving anomaly & baseline).
+    """
+    logger.info("Running daily maintenance task...")
+    from backend.app.database import AsyncSessionLocal
+    from backend.app.models import Screenshot, Baseline, CheckResult
+    from sqlalchemy import text, select, delete
+    from datetime import datetime, timedelta, timezone
+    from pathlib import Path
+
+    now = datetime.now(timezone.utc)
+
+    async with AsyncSessionLocal() as session:
+        # 1. Ensure monthly partitions exist
+        try:
+            await session.execute(text("SELECT create_monthly_partitions();"))
+            await session.commit()
+            logger.info("Monthly partitions verified/created.")
+        except Exception as e:
+            logger.warning(f"Failed to create monthly partitions: {e}")
+
+        # 2. Clean old check results (>30 days)
+        cutoff_30d = now - timedelta(days=30)
+        try:
+            res = await session.execute(
+                delete(CheckResult).where(CheckResult.checked_at < cutoff_30d)
+            )
+            await session.commit()
+            if res.rowcount and res.rowcount > 0:
+                logger.info(f"Cleaned up {res.rowcount} old check_results records (>30 days).")
+        except Exception as e:
+            logger.warning(f"Failed to clean old check_results: {e}")
+
+        # 3. Clean old normal screenshots (>14 days)
+        cutoff_14d = now - timedelta(days=14)
+        try:
+            b_rows = await session.execute(select(Baseline.screenshot_id))
+            baseline_ids = set(b_rows.scalars().all())
+
+            stmt = select(Screenshot).where(
+                Screenshot.taken_at < cutoff_14d,
+                Screenshot.is_anomaly == False,
+            )
+            if baseline_ids:
+                stmt = stmt.where(Screenshot.id.not_in(baseline_ids))
+
+            old_shots = (await session.execute(stmt.limit(1000))).scalars().all()
+            shots_dir = Path(settings.screenshots_dir)
+            deleted_files = 0
+
+            for shot in old_shots:
+                if shot.file_path:
+                    fp = shots_dir / shot.file_path
+                    if fp.exists():
+                        try:
+                            fp.unlink()
+                            deleted_files += 1
+                        except OSError:
+                            pass
+                if shot.thumb_path:
+                    tp = shots_dir / shot.thumb_path
+                    if tp.exists():
+                        try:
+                            tp.unlink()
+                        except OSError:
+                            pass
+                await session.delete(shot)
+
+            await session.commit()
+            if old_shots:
+                logger.info(f"Cleaned up {len(old_shots)} old normal screenshots ({deleted_files} files deleted).")
+        except Exception as e:
+            logger.warning(f"Failed to clean old screenshots: {e}")
+
+
 def start_scheduler():
     """Start the background scheduler."""
     now = datetime.now(timezone.utc)
@@ -71,10 +149,20 @@ def start_scheduler():
         # Omit next_run_time so first screenshot round runs after screenshot_interval_minutes
     )
 
+    scheduler.add_job(
+        run_daily_maintenance,
+        trigger=IntervalTrigger(hours=24),
+        id="daily_maintenance",
+        name="Daily Maintenance & Cleanup",
+        replace_existing=True,
+        next_run_time=now,  # Run once on startup, then every 24h
+    )
+
     scheduler.start()
     logger.info(
         f"Scheduler started: checks every {settings.check_interval_minutes}min (first run immediate), "
-        f"screenshots every {settings.screenshot_interval_minutes}min"
+        f"screenshots every {settings.screenshot_interval_minutes}min, "
+        f"maintenance every 24h"
     )
 
 

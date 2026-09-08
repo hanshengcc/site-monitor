@@ -1,11 +1,17 @@
 #!/bin/bash
 # Start site-monitor service
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
 pkill -9 -f "uvicorn backend.app.main" 2>/dev/null
 sleep 1
 
-export DATABASE_URL="postgresql+asyncpg://monitor:monitor123@localhost:5433/site_monitor"
-export SCREENSHOTS_DIR="/root/site-monitor/screenshots"
-export PATH="/root/site-monitor/venv/bin:$PATH"
+export PORT="${PORT:-8080}"
+export DATABASE_URL="${DATABASE_URL:-postgresql+asyncpg://monitor:monitor123@localhost:5432/site_monitor}"
+export SCREENSHOTS_DIR="${SCREENSHOTS_DIR:-$SCRIPT_DIR/screenshots}"
 
-cd /root/site-monitor
-exec uvicorn backend.app.main:app --host 0.0.0.0 --port 8888
+if [ -d "$SCRIPT_DIR/venv" ]; then
+    export PATH="$SCRIPT_DIR/venv/bin:$PATH"
+fi
+
+exec uvicorn backend.app.main:app --host 0.0.0.0 --port "$PORT"
