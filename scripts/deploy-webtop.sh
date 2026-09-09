@@ -23,13 +23,33 @@ if [ ! -f /config/.cjk_installed ]; then
         fonts-noto-cjk \
         language-pack-zh-hans \
         xrdp \
-        xorgxrdp
+        xorgxrdp \
+        libgdk-pixbuf2.0-bin \
+        librsvg2-common
     locale-gen zh_CN.UTF-8
+    /usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders --update-cache 2>/dev/null || true
     touch /config/.cjk_installed
     echo "=== Chinese fonts and XRDP installed ==="
 fi
 
-# 2. Sync system user admin and passwords for RDP
+# 2. Patch bubblewrap (bwrap) for unprivileged Docker container support (fixes GTK glycin icon loading)
+if [ -f /usr/bin/bwrap ] && [ ! -f /usr/bin/bwrap.orig ]; then
+    mv /usr/bin/bwrap /usr/bin/bwrap.orig
+    cat << 'BWRAP_EOF' > /usr/bin/bwrap
+#!/bin/bash
+args=("$@")
+for ((i=0; i<${#args[@]}; i++)); do
+    cmd="${args[i]}"
+    if [[ "$cmd" == /* ]] && [[ -f "$cmd" ]] && [[ -x "$cmd" ]] && [[ "$cmd" != *bwrap* ]]; then
+        exec "${args[@]:i}"
+    fi
+done
+exit 127
+BWRAP_EOF
+    chmod 755 /usr/bin/bwrap
+fi
+
+# 3. Sync system user admin and passwords for RDP
 USER_NAME="${CUSTOM_USER:-admin}"
 PASS_WORD="${PASSWORD:-admin321}"
 if ! id "$USER_NAME" >/dev/null 2>&1; then
@@ -38,9 +58,15 @@ fi
 echo "${USER_NAME}:${PASS_WORD}" | chpasswd
 echo "abc:${PASS_WORD}" | chpasswd
 echo "startxfce4" > "/home/${USER_NAME}/.xsession" 2>/dev/null || true
-chown -R "${USER_NAME}":abc "/home/${USER_NAME}/.xsession" 2>/dev/null || true
 
-# 3. Configure and start XRDP for RDP port 3389
+# Pre-populate desktop theme & settings if needed
+if [ -d /config/.config ] && [ ! -d "/home/${USER_NAME}/.config/xfce4" ]; then
+    mkdir -p "/home/${USER_NAME}/.config"
+    cp -a /config/.config/* "/home/${USER_NAME}/.config/" 2>/dev/null || true
+fi
+chown -R "${USER_NAME}":abc "/home/${USER_NAME}" 2>/dev/null || true
+
+# 4. Configure and start XRDP for RDP port 3389
 echo "startxfce4" > /etc/skel/.xsession
 echo "startxfce4" > /config/.xsession
 adduser xrdp ssl-cert 2>/dev/null || true
