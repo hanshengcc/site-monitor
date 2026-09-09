@@ -39,4 +39,4 @@ echo "[4/4] Starting application..."
 export DATABASE_URL="postgresql+asyncpg://monitor:monitor123@localhost:5432/site_monitor"
 export SCREENSHOTS_DIR="./screenshots"
 
-uvicorn backend.app.main:app --host 0.0.0.0 --port 8080 --reload
+uvicorn backend.app.main:app --host 127.0.0.1 --port 8080 --reload
