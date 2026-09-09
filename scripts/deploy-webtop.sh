@@ -69,9 +69,10 @@ chown -R "${USER_NAME}":abc "/home/${USER_NAME}" 2>/dev/null || true
 # 4. Configure and start XRDP for RDP port 3389
 echo "startxfce4" > /etc/skel/.xsession
 echo "startxfce4" > /config/.xsession
-adduser xrdp ssl-cert 2>/dev/null || true
-# Auto-login to Xorg using client-supplied credentials (avoids secondary login screen)
+# Auto-login to Xorg using default or client-supplied credentials (completely eliminates secondary login screen)
 sed -i 's/^autorun=.*/autorun=Xorg/' /etc/xrdp/xrdp.ini 2>/dev/null || true
+sed -i "/\[Xorg\]/,/\[Xvnc\]/ s/^username=.*/username=${USER_NAME}/" /etc/xrdp/xrdp.ini 2>/dev/null || true
+sed -i "/\[Xorg\]/,/\[Xvnc\]/ s/^password=.*/password=${PASS_WORD}/" /etc/xrdp/xrdp.ini 2>/dev/null || true
 service xrdp restart 2>/dev/null || /etc/init.d/xrdp restart 2>/dev/null || true
 INIT_EOF
 chmod +x "$WEBTOP_DIR/config/custom-cont-init.d/01-chinese-fonts.sh"
