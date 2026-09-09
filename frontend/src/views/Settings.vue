@@ -161,19 +161,25 @@
                 <el-tag size="small" type="info" style="margin-left: 6px">{{ row.total_targets }}个</el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="组并发数" width="140" align="center">
+            <el-table-column label="组并发数" width="130" align="center">
               <template #default="{ row }">
                 <el-input-number v-model="row.max_concurrency" :min="1" :max="500" size="small"
                   @change="onGroupChange(row)" />
               </template>
             </el-table-column>
-            <el-table-column label="超时(秒)" width="130" align="center">
+            <el-table-column label="速率限制(QPS)" width="140" align="center">
+              <template #default="{ row }">
+                <el-input-number v-model="row.rate_limit" :min="0" :max="1000" size="small"
+                  @change="onGroupChange(row)" />
+              </template>
+            </el-table-column>
+            <el-table-column label="超时(秒)" width="120" align="center">
               <template #default="{ row }">
                 <el-input-number v-model="row.request_timeout" :min="3" :max="120" size="small"
                   @change="onGroupChange(row)" />
               </template>
             </el-table-column>
-            <el-table-column label="User-Agent" min-width="260">
+            <el-table-column label="User-Agent" min-width="240">
               <template #default="{ row }">
                 <el-select v-model="row.user_agent" filterable allow-create clearable size="small"
                   placeholder="继承全局设置" style="width: 100%" @change="onGroupChange(row)">
@@ -203,9 +209,10 @@
           <div style="margin-top: 16px; padding: 12px; background: #f5f7fa; border-radius: 6px; font-size: 13px; color: #666; line-height: 2">
             <b>说明:</b><br/>
             • <b>组并发数</b>: 该分组内最多同时进行的检测数。同一服务器/CDN 上的站点建议设为 <b>5~20</b>，避免触发限流。<br/>
+            • <b>速率限制(QPS)</b>: 每秒最大发起的请求数。设为 <b>0</b> 表示不限制；建议设为 <b>5~20</b> 平滑发压，保护源站不被打崩。<br/>
             • <b>超时</b>: 该组的 HTTP 请求超时秒数。响应慢的站点可调大到 30~60秒。<br/>
             • <b>User-Agent</b>: 留空则继承全局设置，也可为每组单独指定。<br/>
-            • <b>全局并发</b>仍受“检测设置”页的上限控制，分组并发在此范围内生效。
+            • <b>全局调度</b>: 所有分组自动通过 Round-Robin 算法公平交替轮询执行，各组互不阻塞。
           </div>
         </el-card>
       </el-tab-pane>

@@ -51,6 +51,7 @@ class GroupSetting(Base):
 
     group_name = Column(Text, primary_key=True)
     max_concurrency = Column(Integer, default=10)
+    rate_limit = Column(Integer, default=0)  # 0 or None means unlimited QPS
     request_timeout = Column(Integer, default=15)
     user_agent = Column(Text)
     enabled = Column(Boolean, default=True)

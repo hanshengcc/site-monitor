@@ -174,9 +174,13 @@ CREATE TABLE IF NOT EXISTS global_settings (
 CREATE TABLE IF NOT EXISTS group_settings (
     group_name      TEXT PRIMARY KEY,
     max_concurrency INTEGER DEFAULT 10,
+    rate_limit      INTEGER DEFAULT 0,          -- 每秒最大请求数(QPS限制, 0表示不限制)
     request_timeout INTEGER DEFAULT 15,
     user_agent      TEXT,
     enabled         BOOLEAN DEFAULT TRUE,
     note            TEXT,
     updated_at      TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- 兼容老数据库字段迁移
+ALTER TABLE group_settings ADD COLUMN IF NOT EXISTS rate_limit INTEGER DEFAULT 0;

@@ -262,6 +262,7 @@ async def _run_retry_failed(group: str = None):
     import httpx
     from backend.app.checker import (
         _make_ssl_context, _flush_buffer, _load_group_settings, check_single,
+        interleave_by_group, GroupRateLimiter,
     )
     from backend.app.config import settings as app_settings
     from loguru import logger
@@ -298,10 +299,14 @@ async def _run_retry_failed(group: str = None):
         retry_progress.update({"running": False, "total": 0})
         return
 
+    # Fair round-robin interleave across groups
+    if not group:
+        targets = interleave_by_group(targets)
+
     total = len(targets)
     retry_progress["total"] = total
 
-    # ---- Load group concurrency settings ----
+    # ---- Load group concurrency and rate limit settings ----
     group_cfg = await _load_group_settings()
     default_group_concurrency = 10
     max_concurrent = app_settings.max_concurrent_checks
@@ -309,19 +314,25 @@ async def _run_retry_failed(group: str = None):
     groups_in_use = set(t.group for t in targets)
     global_sem = asyncio.Semaphore(max_concurrent)
     group_sems: dict[str, asyncio.Semaphore] = {}
+    group_rate_limiters: dict[str, GroupRateLimiter] = {}
+
     for g in groups_in_use:
         gc = group_cfg.get(g, {})
         limit = gc.get("max_concurrency", default_group_concurrency)
         group_sems[g] = asyncio.Semaphore(limit)
+        qps = gc.get("rate_limit") or 0
+        if qps > 0:
+            group_rate_limiters[g] = GroupRateLimiter(rate=qps)
 
     logger.info(
         f"Retry-failed: {total} targets to retry, {skipped} domain-expired skipped "
-        f"(global max={max_concurrent})"
+        f"(global max={max_concurrent}, round-robin interleaved)"
     )
     for g in sorted(groups_in_use):
         gc = group_cfg.get(g, {})
+        rl_info = f", QPS={gc.get('rate_limit')}" if gc.get("rate_limit") else ", QPS=unlimited"
         logger.info(
-            f"  Retry group [{g}]: concurrency={gc.get('max_concurrency', default_group_concurrency)}"
+            f"  Retry group [{g}]: concurrency={gc.get('max_concurrency', default_group_concurrency)}{rl_info}"
         )
 
     default_ua = app_settings.default_user_agent
@@ -343,9 +354,13 @@ async def _run_retry_failed(group: str = None):
         headers.update(extra_headers)
 
         group_sem = group_sems.get(target.group, asyncio.Semaphore(default_group_concurrency))
+        limiter = group_rate_limiters.get(target.group)
 
-        async with global_sem:
-            async with group_sem:
+        async with group_sem:
+            async with global_sem:
+                if limiter:
+                    await limiter.acquire()
+
                 r = await check_single(
                     client, target.id, url,
                     expect_status=target.expect_status,

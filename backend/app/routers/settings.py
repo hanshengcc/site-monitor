@@ -61,6 +61,7 @@ async def update_global_settings(body: dict, db: AsyncSession = Depends(get_db))
 
 class GroupSettingUpdate(BaseModel):
     max_concurrency: Optional[int] = None
+    rate_limit: Optional[int] = None
     request_timeout: Optional[int] = None
     user_agent: Optional[str] = None
     enabled: Optional[bool] = None
@@ -95,6 +96,7 @@ async def list_group_settings(db: AsyncSession = Depends(get_db)):
             "group_name": r.group,
             "total_targets": r.total,
             "max_concurrency": gs.max_concurrency if gs else 10,
+            "rate_limit": gs.rate_limit if (gs and gs.rate_limit is not None) else 0,
             "request_timeout": gs.request_timeout if gs else 15,
             "user_agent": gs.user_agent if gs else None,
             "enabled": gs.enabled if gs else True,

@@ -316,17 +316,68 @@ async def _flush_buffer(buffer: list):
         logger.error(f"DB flush failed for {len(buffer)} results: {e}")
 
 
-from collections import defaultdict
+from collections import defaultdict, deque
+
+
+class GroupRateLimiter:
+    """Token Bucket rate limiter for per-group QPS control."""
+    def __init__(self, rate: float):
+        self.rate = max(0.1, float(rate))
+        self.capacity = max(1.0, float(rate))
+        self.tokens = self.capacity
+        self.updated_at = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self):
+        async with self._lock:
+            now = time.monotonic()
+            elapsed = now - self.updated_at
+            self.updated_at = now
+            self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
+            if self.tokens < 1.0:
+                needed = 1.0 - self.tokens
+                wait_time = needed / self.rate
+                await asyncio.sleep(wait_time)
+                self.tokens = 0.0
+                self.updated_at = time.monotonic()
+            else:
+                self.tokens -= 1.0
+
+
+def interleave_by_group(targets: list) -> list:
+    """Interleave targets by group in round-robin fashion.
+    Ensures fair scheduling across different groups and avoids starvation.
+    Example:
+      Group A: [A1, A2, A3]
+      Group B: [B1, B2]
+      Group C: [C1]
+      Result:  [A1, B1, C1, A2, B2, A3]
+    """
+    if not targets or len(targets) <= 1:
+        return targets
+
+    grouped = defaultdict(deque)
+    for t in targets:
+        grouped[t.group].append(t)
+
+    interleaved = []
+    while grouped:
+        for k in list(grouped.keys()):
+            interleaved.append(grouped[k].popleft())
+            if not grouped[k]:
+                del grouped[k]
+    return interleaved
 
 
 async def _load_group_settings() -> dict:
-    """Load per-group concurrency/timeout/ua settings from DB."""
+    """Load per-group concurrency/rate_limit/timeout/ua settings from DB."""
     from backend.app.models import GroupSetting
     async with AsyncSessionLocal() as session:
         rows = await session.execute(select(GroupSetting))
         return {
             gs.group_name: {
                 "max_concurrency": gs.max_concurrency or 10,
+                "rate_limit": gs.rate_limit or 0,
                 "request_timeout": gs.request_timeout or settings.check_timeout,
                 "user_agent": gs.user_agent,
                 "enabled": gs.enabled if gs.enabled is not None else True,
@@ -336,10 +387,12 @@ async def _load_group_settings() -> dict:
 
 
 async def run_checks(group: Optional[str] = None):
-    """Run HTTP checks with two-level concurrency:
-    - Global semaphore: total max concurrent (e.g. 200)
-    - Per-group semaphore: each group has its own limit (e.g. Taky=10, Danny=50)
-    If group is specified, only targets in that group are checked.
+    """Run HTTP checks with fair round-robin scheduling, concurrency limits, and per-group QPS rate limits:
+    - Round-robin interleaving across groups to prevent large groups from blocking smaller ones
+    - Per-group semaphore: limits in-flight connections per group (e.g. 10)
+    - Global semaphore: limits total concurrent requests across all groups (e.g. 200)
+    - Per-group rate limiter (Token Bucket): limits requests per second (QPS)
+    - Semaphore acquisition order: group_sem -> global_sem (prevents starvation)
     """
     if check_progress.get("running"):
         logger.warning("Previous check round still running, skip.")
@@ -366,6 +419,10 @@ async def run_checks(group: Optional[str] = None):
     group_cfg = await _load_group_settings()
     default_group_concurrency = 10
 
+    # Fair round-robin interleave across groups
+    if not group:
+        targets = interleave_by_group(targets)
+
     total = len(targets)
     max_concurrent = settings.max_concurrent_checks
 
@@ -373,23 +430,29 @@ async def run_checks(group: Optional[str] = None):
     groups_in_use = set(t.group for t in targets)
     for g in sorted(groups_in_use):
         gc = group_cfg.get(g, {})
-        logger.info(f"  Group [{g}]: concurrency={gc.get('max_concurrency', default_group_concurrency)}, "
-                    f"timeout={gc.get('request_timeout', settings.check_timeout)}s")
+        rl_info = f", QPS={gc.get('rate_limit')}" if gc.get("rate_limit") else ", QPS=unlimited"
+        logger.info(f"  Group [{g}]: concurrency={gc.get('max_concurrency', default_group_concurrency)}"
+                    f"{rl_info}, timeout={gc.get('request_timeout', settings.check_timeout)}s")
 
-    logger.info(f"Checking {total} targets (global max={max_concurrent})")
+    logger.info(f"Checking {total} targets (global max={max_concurrent}, round-robin interleaved)")
     check_progress.update({"running": True, "total": total, "done": 0, "ok": 0, "fail": 0, "group": group})
 
     # Write queue
     write_queue = asyncio.Queue(maxsize=500)
     writer_task = asyncio.create_task(_db_writer(write_queue))
 
-    # Concurrency controls
+    # Concurrency and Rate Limiting controls
     global_sem = asyncio.Semaphore(max_concurrent)
     group_sems: dict[str, asyncio.Semaphore] = {}
+    group_rate_limiters: dict[str, GroupRateLimiter] = {}
+
     for g in groups_in_use:
         gc = group_cfg.get(g, {})
         limit = gc.get("max_concurrency", default_group_concurrency)
         group_sems[g] = asyncio.Semaphore(limit)
+        qps = gc.get("rate_limit") or 0
+        if qps > 0:
+            group_rate_limiters[g] = GroupRateLimiter(rate=qps)
 
     default_ua = settings.default_user_agent
 
@@ -413,9 +476,15 @@ async def run_checks(group: Optional[str] = None):
         headers.update(extra_headers)
 
         group_sem = group_sems.get(target.group, asyncio.Semaphore(default_group_concurrency))
+        limiter = group_rate_limiters.get(target.group)
 
-        async with global_sem:
-            async with group_sem:
+        # Acquisition order: group_sem FIRST, then global_sem.
+        # This prevents one large group from monopolizing all global permits while waiting on its own limit.
+        async with group_sem:
+            async with global_sem:
+                if limiter:
+                    await limiter.acquire()
+
                 r = await check_single(
                     client, target.id, url,
                     expect_status=target.expect_status,
