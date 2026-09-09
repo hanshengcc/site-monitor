@@ -122,10 +122,10 @@ chown -R abc:abc /config/.config /config/.xprofile /config/.xinputrc 2>/dev/null
 echo "startxfce4" > /etc/skel/.xsession
 echo "startxfce4" > /config/.xsession
 
-# Fix socket permissions & session cleanup to prevent black screen
+# Fix socket permissions & session persistence (prevent sesman socket teardown on disconnect)
 sed -i 's/^#SessionSockdirGroup=.*/SessionSockdirGroup=xrdp/' /etc/xrdp/sesman.ini 2>/dev/null || true
-sed -i 's/^KillDisconnected=.*/KillDisconnected=true/' /etc/xrdp/sesman.ini 2>/dev/null || true
-sed -i 's/^DisconnectedTimeLimit=.*/DisconnectedTimeLimit=5/' /etc/xrdp/sesman.ini 2>/dev/null || true
+sed -i 's/^KillDisconnected=.*/KillDisconnected=false/' /etc/xrdp/sesman.ini 2>/dev/null || true
+sed -i 's/^DisconnectedTimeLimit=.*/DisconnectedTimeLimit=0/' /etc/xrdp/sesman.ini 2>/dev/null || true
 usermod -a -G root,ssl-cert xrdp 2>/dev/null || true
 
 # Direct startwm.sh to ensure XFCE and IME start reliably
@@ -162,9 +162,35 @@ sed -i 's/^autorun=.*/autorun=Xorg/' /etc/xrdp/xrdp.ini 2>/dev/null || true
 sed -i "/\[Xorg\]/,/\[Xvnc\]/ s/^username=.*/username=${USER_NAME}/" /etc/xrdp/xrdp.ini 2>/dev/null || true
 sed -i "/\[Xorg\]/,/\[Xvnc\]/ s/^password=.*/password=${PASS_WORD}/" /etc/xrdp/xrdp.ini 2>/dev/null || true
 
+# Install & start XRDP auto-healing watchdog
+cat << 'WATCHDOG_EOF' > /usr/local/bin/xrdp-watchdog.sh
+#!/bin/bash
+while true; do
+    sleep 3
+    if ! pgrep -x xrdp-sesman >/dev/null 2>&1 || [ ! -S /run/xrdp/sockdir/sesman.socket ]; then
+        echo "[xrdp-watchdog] $(date): sesman is not healthy, reviving..." >> /var/log/xrdp-watchdog.log
+        killall -9 xrdp xrdp-sesman 2>/dev/null || true
+        rm -rf /run/xrdp /var/run/xrdp
+        /etc/init.d/xrdp start 2>/dev/null || true
+        sleep 2
+        continue
+    fi
+    if ! pgrep -x xrdp >/dev/null 2>&1 || ! ss -tlpn | grep -q ':3389 '; then
+        echo "[xrdp-watchdog] $(date): xrdp is not listening on 3389, restarting..." >> /var/log/xrdp-watchdog.log
+        killall -9 xrdp 2>/dev/null || true
+        service xrdp start 2>/dev/null || /etc/init.d/xrdp start 2>/dev/null || true
+        sleep 2
+        continue
+    fi
+done
+WATCHDOG_EOF
+chmod +x /usr/local/bin/xrdp-watchdog.sh
+
 killall -9 xrdp xrdp-sesman 2>/dev/null || true
+pkill -f xrdp-watchdog.sh 2>/dev/null || true
 rm -f /var/run/xrdp/*.pid /run/xrdp/*.pid
 service xrdp start 2>/dev/null || /etc/init.d/xrdp start 2>/dev/null || true
+nohup /usr/local/bin/xrdp-watchdog.sh >/dev/null 2>&1 &
 INIT_EOF
 chmod +x "$WEBTOP_DIR/config/custom-cont-init.d/01-chinese-fonts.sh"
 
