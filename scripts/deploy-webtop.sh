@@ -25,11 +25,26 @@ if [ ! -f /config/.cjk_installed ]; then
         xrdp \
         xorgxrdp \
         libgdk-pixbuf2.0-bin \
-        librsvg2-common
+        librsvg2-common \
+        fcitx \
+        fcitx-googlepinyin \
+        fcitx-pinyin \
+        fcitx-frontend-gtk3 \
+        fcitx-frontend-gtk2 \
+        fcitx-ui-classic
     locale-gen zh_CN.UTF-8
     /usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders --update-cache 2>/dev/null || true
+    echo "run_im fcitx" > /etc/X11/xinit/xinputrc 2>/dev/null || true
+    cat << 'ENV_EOF' > /etc/profile.d/fcitx.sh
+export GTK_IM_MODULE=fcitx
+export QT_IM_MODULE=fcitx
+export XMODIFIERS=@im=fcitx
+export SDL_IM_MODULE=fcitx
+ENV_EOF
+    mkdir -p /etc/xdg/autostart
+    cp -f /usr/share/fcitx/xdg/autostart/fcitx-autostart.desktop /etc/xdg/autostart/ 2>/dev/null || true
     touch /config/.cjk_installed
-    echo "=== Chinese fonts and XRDP installed ==="
+    echo "=== Chinese fonts, XRDP, and Fcitx IME installed ==="
 fi
 
 # 2. Patch bubblewrap (bwrap) for unprivileged Docker container support (fixes GTK glycin icon loading)
@@ -59,12 +74,49 @@ echo "${USER_NAME}:${PASS_WORD}" | chpasswd
 echo "abc:${PASS_WORD}" | chpasswd
 echo "startxfce4" > "/home/${USER_NAME}/.xsession" 2>/dev/null || true
 
-# Pre-populate desktop theme & settings if needed
+# Pre-populate desktop theme, settings & Fcitx IME config
+for DIR in "/home/${USER_NAME}" "/config" "/etc/skel"; do
+    mkdir -p "$DIR/.config/fcitx" "$DIR/.config/autostart"
+    cat << 'FCITX_EOF' > "$DIR/.config/fcitx/profile"
+[Profile]
+DefaultIMName=fcitx-keyboard-us
+ShareInputState=No
+UsePreedit=True
+ShowInputWindowAfterSwitching=True
+ShowInputWindowWhenFocusIn=False
+ShowInputWindowCompact=False
+
+[Profile/Order]
+0=fcitx-keyboard-us
+1=googlepinyin
+
+[Profile/TriggerKey]
+0=CTRL_SPACE
+1=CTRL_SHIFT
+FCITX_EOF
+
+    cat << 'HOTKEY_EOF' > "$DIR/.config/fcitx/config"
+[Hotkey]
+TriggerKey=CTRL_SPACE
+SwitchKey=L_SHIFT
+HOTKEY_EOF
+
+    cat << 'XP_EOF' > "$DIR/.xprofile"
+export GTK_IM_MODULE=fcitx
+export QT_IM_MODULE=fcitx
+export XMODIFIERS=@im=fcitx
+export SDL_IM_MODULE=fcitx
+fcitx -d &
+XP_EOF
+    cp -f /usr/share/fcitx/xdg/autostart/fcitx-autostart.desktop "$DIR/.config/autostart/" 2>/dev/null || true
+    echo "run_im fcitx" > "$DIR/.xinputrc" 2>/dev/null || true
+done
+
 if [ -d /config/.config ] && [ ! -d "/home/${USER_NAME}/.config/xfce4" ]; then
-    mkdir -p "/home/${USER_NAME}/.config"
     cp -a /config/.config/* "/home/${USER_NAME}/.config/" 2>/dev/null || true
 fi
 chown -R "${USER_NAME}":abc "/home/${USER_NAME}" 2>/dev/null || true
+chown -R abc:abc /config/.config /config/.xprofile /config/.xinputrc 2>/dev/null || true
 
 # 4. Configure and start XRDP for RDP port 3389
 echo "startxfce4" > /etc/skel/.xsession
@@ -76,7 +128,7 @@ sed -i 's/^KillDisconnected=.*/KillDisconnected=true/' /etc/xrdp/sesman.ini 2>/d
 sed -i 's/^DisconnectedTimeLimit=.*/DisconnectedTimeLimit=5/' /etc/xrdp/sesman.ini 2>/dev/null || true
 usermod -a -G root,ssl-cert xrdp 2>/dev/null || true
 
-# Direct startwm.sh to ensure XFCE starts reliably without hanging
+# Direct startwm.sh to ensure XFCE and IME start reliably
 cat << 'STARTWM_EOF' > /etc/xrdp/startwm.sh
 #!/bin/sh
 if test -r /etc/profile; then
@@ -85,10 +137,22 @@ fi
 if test -r ~/.profile; then
 	. ~/.profile
 fi
+if test -r ~/.xprofile; then
+	. ~/.xprofile
+fi
 export XDG_SESSION_TYPE=x11
 export XDG_CURRENT_DESKTOP=XFCE
 export XDG_CONFIG_DIRS=/etc/xdg/xdg-xubuntu:/etc/xdg
 export DESKTOP_SESSION=xubuntu
+export GTK_IM_MODULE=fcitx
+export QT_IM_MODULE=fcitx
+export XMODIFIERS=@im=fcitx
+export SDL_IM_MODULE=fcitx
+
+if ! pgrep -u $(id -u) fcitx >/dev/null 2>&1; then
+    fcitx -d &
+fi
+
 exec startxfce4
 STARTWM_EOF
 chmod 755 /etc/xrdp/startwm.sh
