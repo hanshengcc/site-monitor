@@ -5,15 +5,10 @@ WEBTOP_DIR="/opt/webtop"
 mkdir -p "$WEBTOP_DIR/config/custom-cont-init.d"
 chmod -R 755 "$WEBTOP_DIR"
 
-# Generate strong random password if not exists
-PWD_FILE="$WEBTOP_DIR/.password"
-if [ ! -f "$PWD_FILE" ]; then
-    WEBTOP_PASS="WebTop@$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 8)!"
-    echo "$WEBTOP_PASS" > "$PWD_FILE"
-    chmod 600 "$PWD_FILE"
-else
-    WEBTOP_PASS=$(cat "$PWD_FILE")
-fi
+WEBTOP_USER="admin"
+WEBTOP_PASS="admin321"
+echo "$WEBTOP_PASS" > "$WEBTOP_DIR/.password"
+chmod 600 "$WEBTOP_DIR/.password"
 
 # 1. Chinese fonts and XRDP init script for the container
 cat << 'INIT_EOF' > "$WEBTOP_DIR/config/custom-cont-init.d/01-chinese-fonts.sh"
@@ -34,7 +29,18 @@ if [ ! -f /config/.cjk_installed ]; then
     echo "=== Chinese fonts and XRDP installed ==="
 fi
 
-# 2. Configure and start XRDP for RDP port 3389
+# 2. Sync system user admin and passwords for RDP
+USER_NAME="${CUSTOM_USER:-admin}"
+PASS_WORD="${PASSWORD:-admin321}"
+if ! id "$USER_NAME" >/dev/null 2>&1; then
+    useradd -m -s /bin/bash -g abc -G sudo,docker "$USER_NAME" 2>/dev/null || true
+fi
+echo "${USER_NAME}:${PASS_WORD}" | chpasswd
+echo "abc:${PASS_WORD}" | chpasswd
+echo "startxfce4" > "/home/${USER_NAME}/.xsession" 2>/dev/null || true
+chown -R "${USER_NAME}":abc "/home/${USER_NAME}/.xsession" 2>/dev/null || true
+
+# 3. Configure and start XRDP for RDP port 3389
 echo "startxfce4" > /etc/skel/.xsession
 echo "startxfce4" > /config/.xsession
 adduser xrdp ssl-cert 2>/dev/null || true
