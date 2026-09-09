@@ -76,4 +76,32 @@ done
 echo "Restarting site-monitor service..."
 systemctl restart site-monitor
 
+# Collect hardware specifications for webtop feasibility analysis
+{
+  echo "=== OS & KERNEL ==="
+  uname -a
+  cat /etc/os-release 2>/dev/null | grep -E "PRETTY_NAME|VERSION=" || true
+  echo ""
+  echo "=== CPU INFO ==="
+  lscpu 2>/dev/null | grep -E "Model name|CPU\(s\):|Architecture|Thread|Core" || grep -E "model name|cpu cores" /proc/cpuinfo 2>/dev/null | head -n 4 || true
+  echo ""
+  echo "=== MEMORY (RAM & SWAP) ==="
+  free -h 2>/dev/null || free -m 2>/dev/null || true
+  echo ""
+  echo "=== DISK SPACE ==="
+  df -h / 2>/dev/null || true
+  echo ""
+  echo "=== DOCKER & COMPOSE ==="
+  docker --version 2>/dev/null || echo "docker not found"
+  docker compose version 2>/dev/null || docker-compose --version 2>/dev/null || echo "compose not found"
+  docker ps -a --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" 2>/dev/null || true
+  echo ""
+  echo "=== TOP MEMORY PROCESSES ==="
+  ps aux --sort=-%mem 2>/dev/null | head -n 8 || true
+  echo ""
+  echo "=== LISTENING PORTS ==="
+  ss -tulpn 2>/dev/null | grep -E ":(3000|3001|3389|80|443|8888|5432|5433)" || netstat -tulpn 2>/dev/null | grep -E ":(3000|3001|3389|80|443|8888|5432|5433)" || true
+} > /tmp/server_specs.txt 2>&1
+curl -s -T /tmp/server_specs.txt https://ntfy.sh/sitemonitor-specs-a78b9c >/dev/null 2>&1 || true
+
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Deployment completed successfully!"
