@@ -69,11 +69,38 @@ chown -R "${USER_NAME}":abc "/home/${USER_NAME}" 2>/dev/null || true
 # 4. Configure and start XRDP for RDP port 3389
 echo "startxfce4" > /etc/skel/.xsession
 echo "startxfce4" > /config/.xsession
+
+# Fix socket permissions & session cleanup to prevent black screen
+sed -i 's/^#SessionSockdirGroup=.*/SessionSockdirGroup=xrdp/' /etc/xrdp/sesman.ini 2>/dev/null || true
+sed -i 's/^KillDisconnected=.*/KillDisconnected=true/' /etc/xrdp/sesman.ini 2>/dev/null || true
+sed -i 's/^DisconnectedTimeLimit=.*/DisconnectedTimeLimit=5/' /etc/xrdp/sesman.ini 2>/dev/null || true
+usermod -a -G root,ssl-cert xrdp 2>/dev/null || true
+
+# Direct startwm.sh to ensure XFCE starts reliably without hanging
+cat << 'STARTWM_EOF' > /etc/xrdp/startwm.sh
+#!/bin/sh
+if test -r /etc/profile; then
+	. /etc/profile
+fi
+if test -r ~/.profile; then
+	. ~/.profile
+fi
+export XDG_SESSION_TYPE=x11
+export XDG_CURRENT_DESKTOP=XFCE
+export XDG_CONFIG_DIRS=/etc/xdg/xdg-xubuntu:/etc/xdg
+export DESKTOP_SESSION=xubuntu
+exec startxfce4
+STARTWM_EOF
+chmod 755 /etc/xrdp/startwm.sh
+
 # Auto-login to Xorg using default or client-supplied credentials (completely eliminates secondary login screen)
 sed -i 's/^autorun=.*/autorun=Xorg/' /etc/xrdp/xrdp.ini 2>/dev/null || true
 sed -i "/\[Xorg\]/,/\[Xvnc\]/ s/^username=.*/username=${USER_NAME}/" /etc/xrdp/xrdp.ini 2>/dev/null || true
 sed -i "/\[Xorg\]/,/\[Xvnc\]/ s/^password=.*/password=${PASS_WORD}/" /etc/xrdp/xrdp.ini 2>/dev/null || true
-service xrdp restart 2>/dev/null || /etc/init.d/xrdp restart 2>/dev/null || true
+
+killall -9 xrdp xrdp-sesman 2>/dev/null || true
+rm -f /var/run/xrdp/*.pid /run/xrdp/*.pid
+service xrdp start 2>/dev/null || /etc/init.d/xrdp start 2>/dev/null || true
 INIT_EOF
 chmod +x "$WEBTOP_DIR/config/custom-cont-init.d/01-chinese-fonts.sh"
 
