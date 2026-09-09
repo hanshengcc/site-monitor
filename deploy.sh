@@ -53,6 +53,14 @@ if echo "$DIFF_FILES" | grep -q "^frontend/"; then
 fi
 
 # Ensure systemd service listens only on localhost (127.0.0.1)
+SERVICE_PATH=$(systemctl show -p FragmentPath site-monitor 2>/dev/null | cut -d= -f2)
+if [ -n "$SERVICE_PATH" ] && [ -f "$SERVICE_PATH" ]; then
+    if grep -q "0.0.0.0" "$SERVICE_PATH"; then
+        echo "Updating $SERVICE_PATH to 127.0.0.1..."
+        sed -i 's/0\.0\.0\.0/127.0.0.1/g' "$SERVICE_PATH"
+        systemctl daemon-reload
+    fi
+fi
 for s in /etc/systemd/system/site-monitor*.service /etc/systemd/system/*monitor*.service /lib/systemd/system/site-monitor*.service; do
     if [ -f "$s" ]; then
         if grep -qE -- "--host[ =]0\.0\.0\.0|-h[ =]0\.0\.0\.0" "$s"; then
