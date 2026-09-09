@@ -38,7 +38,8 @@ if echo "$DIFF_FILES" | grep -q "init.sql"; then
     if docker ps 2>/dev/null | grep -q "site-monitor-db"; then
         docker exec -i site-monitor-db psql -U monitor -d site_monitor < init.sql 2>&1 || true
     elif command -v psql >/dev/null 2>&1; then
-        PGPASSWORD=monitor123 psql -h localhost -U monitor -d site_monitor < init.sql 2>&1 || true
+        PGPASSWORD=monitor123 psql -h localhost -p 5433 -U monitor -d site_monitor < init.sql 2>&1 || \
+        PGPASSWORD=monitor123 psql -h localhost -p 5432 -U monitor -d site_monitor < init.sql 2>&1 || true
     fi
 fi
 

@@ -75,8 +75,12 @@ async def list_group_settings(db: AsyncSession = Depends(get_db)):
     from sqlalchemy import func
 
     # Get group settings
-    rows = await db.execute(select(GroupSetting).order_by(GroupSetting.group_name))
-    group_settings = {gs.group_name: gs for gs in rows.scalars().all()}
+    try:
+        rows = await db.execute(select(GroupSetting).order_by(GroupSetting.group_name))
+        group_settings = {gs.group_name: gs for gs in rows.scalars().all()}
+    except Exception as e:
+        logger.warning(f"Failed to query group settings: {e}")
+        group_settings = {}
 
     # Get group stats
     stmt = (

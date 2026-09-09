@@ -47,6 +47,36 @@ async def load_settings_from_db():
         logger.warning(f"Failed to load global settings from DB on startup: {e}")
 
 
+async def init_db_schema():
+    """Ensure newly added columns and tables exist (lightweight auto-migration)."""
+    from sqlalchemy import text
+    try:
+        async with AsyncSessionLocal() as session:
+            await session.execute(text("""
+                CREATE TABLE IF NOT EXISTS global_settings (
+                    key TEXT PRIMARY KEY,
+                    value JSONB NOT NULL
+                )
+            """))
+            await session.execute(text("""
+                CREATE TABLE IF NOT EXISTS group_settings (
+                    group_name TEXT PRIMARY KEY,
+                    max_concurrency INTEGER DEFAULT 10,
+                    rate_limit INTEGER DEFAULT 0,
+                    request_timeout INTEGER DEFAULT 15,
+                    user_agent TEXT,
+                    enabled BOOLEAN DEFAULT TRUE,
+                    note TEXT,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await session.execute(text("ALTER TABLE group_settings ADD COLUMN IF NOT EXISTS rate_limit INTEGER DEFAULT 0"))
+            await session.commit()
+            logger.info("Database schema auto-check completed.")
+    except Exception as e:
+        logger.warning(f"Database schema auto-check warning: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
@@ -54,6 +84,9 @@ async def lifespan(app: FastAPI):
 
     # Ensure screenshots dir exists
     Path(settings.screenshots_dir).mkdir(parents=True, exist_ok=True)
+
+    # Auto-migrate/verify database schema
+    await init_db_schema()
 
     # Load persistent settings from DB
     await load_settings_from_db()
