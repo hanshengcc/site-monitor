@@ -53,14 +53,16 @@ if echo "$DIFF_FILES" | grep -q "^frontend/"; then
 fi
 
 # Ensure systemd service listens only on localhost (127.0.0.1)
-SERVICE_FILE="/etc/systemd/system/site-monitor.service"
-if [ -f "$SERVICE_FILE" ]; then
-    if grep -q -- "--host 0.0.0.0" "$SERVICE_FILE"; then
-        echo "Updating $SERVICE_FILE to listen on 127.0.0.1 (localhost only)..."
-        sed -i 's/--host 0.0.0.0/--host 127.0.0.1/g' "$SERVICE_FILE"
-        systemctl daemon-reload
+for s in /etc/systemd/system/site-monitor*.service /etc/systemd/system/*monitor*.service /lib/systemd/system/site-monitor*.service; do
+    if [ -f "$s" ]; then
+        if grep -qE -- "--host[ =]0\.0\.0\.0|-h[ =]0\.0\.0\.0" "$s"; then
+            echo "Updating $s to listen on 127.0.0.1 (localhost only)..."
+            sed -i -E 's/--host[ =]0\.0\.0\.0/--host 127.0.0.1/g' "$s"
+            sed -i -E 's/-h[ =]0\.0\.0\.0/-h 127.0.0.1/g' "$s"
+            systemctl daemon-reload
+        fi
     fi
-fi
+done
 
 # Restart site-monitor service
 echo "Restarting site-monitor service..."

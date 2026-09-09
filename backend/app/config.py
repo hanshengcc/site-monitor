@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     viewport_height: int = 800
     consecutive_fails_threshold: int = 3   # N次连续失败才告警
     max_concurrent_checks: int = 200       # HTTP检测并发数
+    localhost_only: bool = True            # 只允许本机/SSH隧道访问(127.0.0.1)
 
     class Config:
         env_file = ".env"

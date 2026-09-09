@@ -5,7 +5,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 from sqlalchemy import select
@@ -116,6 +116,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def localhost_only_middleware(request: Request, call_next):
+    if settings.localhost_only:
+        client_ip = request.client.host if request.client else ""
+        if client_ip not in ("127.0.0.1", "::1", "localhost", "testclient"):
+            return PlainTextResponse(
+                "Forbidden: Localhost access only. Please use SSH tunnel or local reverse proxy.",
+                status_code=403,
+            )
+    return await call_next(request)
 
 # API routers
 app.include_router(targets.router)
