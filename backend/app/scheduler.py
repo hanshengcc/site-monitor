@@ -43,6 +43,11 @@ async def _safe_run_screenshots():
             await run_screenshots()
         except Exception as e:
             logger.exception(f"Screenshot round failed: {e}")
+        finally:
+            try:
+                await close_browser()
+            except Exception:
+                pass
     # Dispatch alerts after screenshots
     try:
         await dispatch_alerts()
