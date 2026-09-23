@@ -265,6 +265,42 @@ class TestPartitionExpiry:
 
 
 # ---------------------------------------------------------------------------
+# Per-target interval scheduling
+# ---------------------------------------------------------------------------
+class TestDueCutoff:
+    def _sql(self, column):
+        from sqlalchemy import or_, select
+        from sqlalchemy.dialects import postgresql
+        from backend.app.intervals import due_cutoff
+        from backend.app.models import Target, TargetStatus
+
+        stmt = (
+            select(Target.id)
+            .outerjoin(TargetStatus, Target.id == TargetStatus.target_id)
+            .where(or_(
+                TargetStatus.last_check_at.is_(None),
+                TargetStatus.last_check_at < due_cutoff(column),
+            ))
+        )
+        return str(stmt.compile(dialect=postgresql.dialect()))
+
+    def test_cutoff_is_relative_to_each_targets_own_column(self):
+        sql = self._sql("check_interval")
+        # The interval comes from the target row, not from a bound constant,
+        # so every target gets its own cadence in a single query.
+        assert "targets.check_interval * interval '1 second'" in sql
+        assert "now() - (targets.check_interval" in sql
+
+    def test_never_checked_targets_are_always_due(self):
+        sql = self._sql("check_interval")
+        assert "target_status.last_check_at IS NULL" in sql
+
+    def test_same_helper_serves_screenshot_and_snapshot_cadence(self):
+        assert "targets.shot_interval" in self._sql("shot_interval")
+        assert "targets.snapshot_interval" in self._sql("snapshot_interval")
+
+
+# ---------------------------------------------------------------------------
 # Certificate recheck throttling
 # ---------------------------------------------------------------------------
 def _needs_ssl_check(last_checked, cutoff):

@@ -8,18 +8,14 @@ from typing import Optional, List
 from loguru import logger
 from playwright.async_api import async_playwright, Browser, Error as PlaywrightError
 from PIL import Image
-from sqlalchemy import or_, select, text
+from sqlalchemy import or_, select
 from sqlalchemy.dialects.postgresql import insert
 
 from backend.app.config import settings
 from backend.app.database import AsyncSessionLocal
 from backend.app.models import Target, Screenshot, TargetStatus, Anomaly
 from backend.app.analyzer import analyze_screenshot
-
-
-def _due_cutoff(interval_column: str):
-    """SQL expression for "older than this target's own interval", in seconds."""
-    return text(f"now() - (targets.{interval_column} * interval '1 second')")
+from backend.app.intervals import due_cutoff
 
 
 _pending_snapshot_tasks: set = set()
@@ -382,7 +378,7 @@ async def run_screenshots(max_targets: Optional[int] = None, force: bool = False
             if not force:
                 stmt = stmt.where(or_(
                     TargetStatus.last_screenshot_at.is_(None),
-                    TargetStatus.last_screenshot_at < _due_cutoff("shot_interval"),
+                    TargetStatus.last_screenshot_at < due_cutoff("shot_interval"),
                 ))
             if max_targets:
                 stmt = stmt.limit(max_targets)

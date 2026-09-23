@@ -7,13 +7,14 @@ from typing import Optional
 
 import httpx
 from loguru import logger
-from sqlalchemy import case, func, select, text
+from sqlalchemy import case, func, or_, select, text
 from sqlalchemy import insert as sa_insert
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 
 from backend.app.config import settings
 from backend.app.database import AsyncSessionLocal
+from backend.app.intervals import due_cutoff
 from backend.app.models import Target, CheckResult, TargetStatus, Anomaly
 
 # Realtime progress (read by /api/tasks/progress)
@@ -600,20 +601,25 @@ async def _load_group_settings() -> dict:
         }
 
 
-async def run_checks(group: Optional[str] = None):
+async def run_checks(group: Optional[str] = None, force: bool = False):
     """Run HTTP checks with fair round-robin scheduling, concurrency limits, and per-group QPS rate limits:
     - Round-robin interleaving across groups to prevent large groups from blocking smaller ones
     - Per-group semaphore: limits in-flight connections per group (e.g. 10)
     - Global semaphore: limits total concurrent requests across all groups (e.g. 200)
     - Per-group rate limiter (Token Bucket): limits requests per second (QPS)
     - Semaphore acquisition order: group_sem -> global_sem (prevents starvation)
+
+    By default only targets whose own check_interval has elapsed are checked, so a
+    target set to 30 minutes is not re-checked by every 5-minute round. Targets
+    that have never been checked are always due. Pass force=True for a manual
+    full sweep, which is what the manual trigger endpoints do.
     """
     if check_progress.get("running"):
         logger.warning("Previous check round still running, skip.")
         return
 
     group_desc = f"group [{group}]" if group else "ALL groups"
-    logger.info(f"Starting HTTP check round for {group_desc}...")
+    logger.info(f"Starting HTTP check round for {group_desc}{' (forced)' if force else ''}...")
     check_progress.update({"running": True, "total": 0, "done": 0, "ok": 0, "fail": 0, "group": group})
 
     # Load targets along with when each one's certificate was last inspected, so
@@ -626,6 +632,11 @@ async def run_checks(group: Optional[str] = None):
         )
         if group:
             stmt = stmt.where(Target.group == group)
+        if not force:
+            stmt = stmt.where(or_(
+                TargetStatus.last_check_at.is_(None),
+                TargetStatus.last_check_at < due_cutoff("check_interval"),
+            ))
         rows = (await session.execute(stmt)).all()
         targets = [row[0] for row in rows]
         ssl_checked_at_by_target = {row[0].id: row[1] for row in rows}
@@ -633,7 +644,10 @@ async def run_checks(group: Optional[str] = None):
     ssl_recheck_cutoff = datetime.now(timezone.utc) - timedelta(hours=settings.ssl_recheck_hours)
 
     if not targets:
-        logger.info(f"No targets to check for {group_desc}.")
+        logger.info(
+            f"No targets due for {group_desc}."
+            if not force else f"No targets to check for {group_desc}."
+        )
         check_progress.update({"running": False, "group": group})
         return
 
@@ -656,7 +670,10 @@ async def run_checks(group: Optional[str] = None):
         logger.info(f"  Group [{g}]: concurrency={gc.get('max_concurrency', default_group_concurrency)}"
                     f"{rl_info}, timeout={gc.get('request_timeout', settings.check_timeout)}s")
 
-    logger.info(f"Checking {total} targets (global max={max_concurrent}, round-robin interleaved)")
+    scope = "all targets (forced)" if force else "targets due by their own check_interval"
+    logger.info(
+        f"Checking {total} {scope} (global max={max_concurrent}, round-robin interleaved)"
+    )
     check_progress.update({"running": True, "total": total, "done": 0, "ok": 0, "fail": 0, "group": group})
 
     # Write queue

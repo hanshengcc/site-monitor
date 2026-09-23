@@ -22,20 +22,24 @@ async def get_check_progress():
 
 @router.post("/check-all")
 async def trigger_check_all(group: Optional[str] = Query(None)):
-    """Manually trigger a check round (all targets or specific group)."""
+    """Manually trigger a check round (all targets or specific group).
+
+    force=True so an explicit manual run covers every target, while the scheduled
+    round only picks up targets whose own check_interval has elapsed.
+    """
     if check_progress.get("running"):
         return {"message": "Check already running", "progress": check_progress}
-    asyncio.create_task(run_checks(group=group))
+    asyncio.create_task(run_checks(group=group, force=True))
     msg = f"Check round triggered for group '{group}'" if group else "Full check round triggered"
     return {"message": msg}
 
 
 @router.post("/check-group/{group}")
 async def trigger_check_group(group: str):
-    """Trigger check for a specific group."""
+    """Trigger check for a specific group (forced: ignores per-target intervals)."""
     if check_progress.get("running"):
         return {"message": "Check already running", "progress": check_progress}
-    asyncio.create_task(run_checks(group=group))
+    asyncio.create_task(run_checks(group=group, force=True))
     return {"message": f"Check round triggered for group '{group}'"}
 
 

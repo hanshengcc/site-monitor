@@ -16,7 +16,8 @@ import httpx
 from backend.app.config import settings
 from backend.app.database import AsyncSessionLocal
 from backend.app.models import Target, Snapshot, TargetStatus
-from backend.app.screenshoter import get_browser, _due_cutoff
+from backend.app.screenshoter import get_browser
+from backend.app.intervals import due_cutoff
 from backend.app.checker import _make_ssl_context
 
 
@@ -308,7 +309,7 @@ async def run_snapshots(group: Optional[str] = None, force: bool = False):
                     TargetStatus, Target.id == TargetStatus.target_id
                 ).where(or_(
                     TargetStatus.last_snapshot_at.is_(None),
-                    TargetStatus.last_snapshot_at < _due_cutoff("snapshot_interval"),
+                    TargetStatus.last_snapshot_at < due_cutoff("snapshot_interval"),
                 ))
             stmt = stmt.order_by(Target.id)
             rows = await session.execute(stmt)

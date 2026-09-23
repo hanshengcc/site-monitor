@@ -355,10 +355,50 @@ async def test_read_queries():
 
 
 # ---------------------------------------------------------------------------
+async def test_check_interval_filter():
+    print("\n[7b] Per-target check_interval decides who is due")
+    from sqlalchemy import or_
+    from backend.app.intervals import due_cutoff
+
+    now = datetime.now(timezone.utc)
+    async with AsyncSessionLocal() as session:
+        # Target 1: 5-minute cadence, checked 1 minute ago    -> not due
+        # Target 2: 5-minute cadence, checked 10 minutes ago  -> due
+        # Target 3: 1-hour cadence, checked 10 minutes ago    -> not due
+        # Target 4: never checked                             -> always due
+        await session.execute(text("UPDATE targets SET check_interval = 300 WHERE id IN (1, 2)"))
+        await session.execute(text("UPDATE targets SET check_interval = 3600 WHERE id = 3"))
+        await session.execute(text(
+            "UPDATE target_status SET last_check_at = :t WHERE target_id = 1"
+        ), {"t": now - timedelta(minutes=1)})
+        await session.execute(text(
+            "UPDATE target_status SET last_check_at = :t WHERE target_id IN (2, 3)"
+        ), {"t": now - timedelta(minutes=10)})
+        await session.execute(text("DELETE FROM target_status WHERE target_id = 4"))
+        await session.commit()
+
+        due = set((await session.execute(
+            select(Target.id)
+            .outerjoin(TargetStatus, Target.id == TargetStatus.target_id)
+            .where(Target.enabled == True)
+            .where(or_(
+                TargetStatus.last_check_at.is_(None),
+                TargetStatus.last_check_at < due_cutoff("check_interval"),
+            ))
+            .where(Target.id.in_([1, 2, 3, 4]))
+        )).scalars().all())
+
+    check("recently checked target is skipped", 1 not in due, f"due={sorted(due)}")
+    check("target past its 5-minute interval is due", 2 in due, f"due={sorted(due)}")
+    check("target on a 1-hour interval is not yet due", 3 not in due, f"due={sorted(due)}")
+    check("never-checked target is always due", 4 in due, f"due={sorted(due)}")
+
+
+# ---------------------------------------------------------------------------
 async def test_due_filters():
     print("\n[8] Screenshot / snapshot interval filters")
     from sqlalchemy import or_
-    from backend.app.screenshoter import _due_cutoff
+    from backend.app.intervals import due_cutoff as _due_cutoff
 
     now = datetime.now(timezone.utc)
     async with AsyncSessionLocal() as session:
@@ -434,6 +474,7 @@ async def main():
     # Re-seed the optimised state for the read tests.
     await test_write_throughput()
     await test_read_queries()
+    await test_check_interval_filter()
     await test_due_filters()
     await test_partition_drop()
 
