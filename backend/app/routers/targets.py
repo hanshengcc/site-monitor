@@ -245,77 +245,109 @@ async def update_target(target_id: int, body: TargetUpdate, db: AsyncSession = D
 
 @router.delete("/groups/{group_name}")
 async def delete_group(group_name: str, db: AsyncSession = Depends(get_db)):
-    """Delete a group and clean up all associated targets, checks, screenshots, and settings from database."""
-    import os
+    """Delete a group and clean up all associated targets, checks, screenshots, snapshots, and settings.
+
+    Uses raw SQL subqueries (DELETE ... WHERE target_id IN (SELECT id FROM targets WHERE group=:g))
+    instead of loading all IDs into Python and passing them as IN() parameters, which fails for
+    large groups (34k+ targets) due to asyncpg parameter limit overflow.
+
+    Deletes child tables in correct FK dependency order to avoid slow per-row constraint checks:
+      baselines -> anomalies -> screenshots -> snapshots -> check_results -> target_status -> targets
+    """
     from loguru import logger
-    from backend.app.models import CheckResult, GroupSetting, Screenshot
+    from backend.app.models import Screenshot, Snapshot
 
-    # 1. Find all target IDs in this group
-    rows = await db.execute(select(Target.id).where(Target.group == group_name))
-    target_ids = [r[0] for r in rows.all()]
+    # 0. Count targets first for the response
+    cnt_row = await db.execute(
+        select(func.count()).select_from(Target).where(Target.group == group_name)
+    )
+    target_count = cnt_row.scalar() or 0
 
-    if target_ids:
-        from backend.app.models import CheckResult, GroupSetting, Screenshot, Snapshot
+    if target_count == 0:
+        # No targets; just clean up orphan group_settings
+        await db.execute(text(
+            "DELETE FROM group_settings WHERE group_name = :g"
+        ), {"g": group_name})
+        await db.commit()
+        return {
+            "ok": True,
+            "group": group_name,
+            "deleted_targets": 0,
+            "message": f"分组 [{group_name}] 不存在或已无站点",
+        }
 
-        # 2. Clean up physical screenshot files on disk
-        try:
-            shot_rows = await db.execute(
-                select(Screenshot.file_path, Screenshot.thumb_path).where(
-                    Screenshot.target_id.in_(target_ids)
-                )
-            )
-            shots_dir = Path(settings.screenshots_dir)
-            for fpath, thumb in shot_rows.all():
-                if fpath:
-                    p = shots_dir / fpath
-                    if p.exists():
-                        try:
-                            p.unlink()
-                        except OSError:
-                            pass
-                if thumb:
-                    p = shots_dir / thumb
-                    if p.exists():
-                        try:
-                            p.unlink()
-                        except OSError:
-                            pass
-        except Exception as e:
-            logger.warning(f"Error cleaning screenshot files for group {group_name}: {e}")
+    logger.info(f"Deleting group [{group_name}]: {target_count} targets, cleaning up all related data...")
 
-        # 3. Clean up physical snapshot files on disk
-        try:
-            snap_rows = await db.execute(
-                select(Snapshot.file_path).where(Snapshot.target_id.in_(target_ids))
-            )
-            snaps_dir = Path(settings.snapshots_dir)
-            for (fpath,) in snap_rows.all():
-                if fpath:
-                    p = snaps_dir / fpath
-                    if p.exists():
-                        try:
-                            p.unlink()
-                        except OSError:
-                            pass
-        except Exception as e:
-            logger.warning(f"Error cleaning snapshot files for group {group_name}: {e}")
+    # 1. Clean up physical screenshot files on disk (stream to avoid OOM for large sets)
+    try:
+        shot_rows = await db.execute(text(
+            "SELECT file_path, thumb_path FROM screenshots "
+            "WHERE target_id IN (SELECT id FROM targets WHERE \"group\" = :g)"
+        ), {"g": group_name})
+        shots_dir = Path(settings.screenshots_dir)
+        for fpath, thumb in shot_rows.all():
+            for p_str in (fpath, thumb):
+                if p_str:
+                    p = shots_dir / p_str
+                    try:
+                        p.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+    except Exception as e:
+        logger.warning(f"Error cleaning screenshot files for group {group_name}: {e}")
 
-        # 4. Clean up check_results (partitioned table without FK cascade)
-        await db.execute(delete(CheckResult).where(CheckResult.target_id.in_(target_ids)))
+    # 2. Clean up physical snapshot files on disk
+    try:
+        snap_rows = await db.execute(text(
+            "SELECT file_path FROM snapshots "
+            "WHERE target_id IN (SELECT id FROM targets WHERE \"group\" = :g)"
+        ), {"g": group_name})
+        snaps_dir = Path(settings.snapshots_dir)
+        for (fpath,) in snap_rows.all():
+            if fpath:
+                p = snaps_dir / fpath
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+    except Exception as e:
+        logger.warning(f"Error cleaning snapshot files for group {group_name}: {e}")
 
-        # 5. Delete targets (cascades to target_status, screenshots, snapshots, baselines, anomalies)
-        await db.execute(delete(Target).where(Target.group == group_name))
+    # 3. Delete DB records in correct FK dependency order using raw SQL subqueries
+    #    This avoids building enormous parameter lists and lets PostgreSQL use indexes.
+    target_subq = 'SELECT id FROM targets WHERE "group" = :g'
 
-    # 6. Delete group_settings
-    from backend.app.models import GroupSetting
-    await db.execute(delete(GroupSetting).where(GroupSetting.group_name == group_name))
+    # baselines references both targets(target_id) and screenshots(screenshot_id)
+    await db.execute(text(f"DELETE FROM baselines WHERE target_id IN ({target_subq})"), {"g": group_name})
+
+    # anomalies references targets(target_id) and screenshots(screenshot_id) with NO ACTION
+    await db.execute(text(f"DELETE FROM anomalies WHERE target_id IN ({target_subq})"), {"g": group_name})
+
+    # screenshots references targets(target_id) CASCADE - but we delete explicitly to be safe
+    await db.execute(text(f"DELETE FROM screenshots WHERE target_id IN ({target_subq})"), {"g": group_name})
+
+    # snapshots references targets(target_id) CASCADE
+    await db.execute(text(f"DELETE FROM snapshots WHERE target_id IN ({target_subq})"), {"g": group_name})
+
+    # check_results is partitioned, no FK cascade
+    await db.execute(text(f"DELETE FROM check_results WHERE target_id IN ({target_subq})"), {"g": group_name})
+
+    # target_status references targets(target_id) CASCADE
+    await db.execute(text(f"DELETE FROM target_status WHERE target_id IN ({target_subq})"), {"g": group_name})
+
+    # Finally delete the targets themselves (no more FK references remain)
+    await db.execute(text('DELETE FROM targets WHERE "group" = :g'), {"g": group_name})
+
+    # 4. Delete group_settings
+    await db.execute(text("DELETE FROM group_settings WHERE group_name = :g"), {"g": group_name})
 
     await db.commit()
+    logger.info(f"Group [{group_name}] deleted: {target_count} targets and all related data cleaned up.")
     return {
         "ok": True,
         "group": group_name,
-        "deleted_targets": len(target_ids),
-        "message": f"分组 [{group_name}] 及其关联的 {len(target_ids)} 个站点与历史数据已彻底从数据库清理",
+        "deleted_targets": target_count,
+        "message": f"分组 [{group_name}] 及其关联的 {target_count} 个站点与历史数据已彻底从数据库清理",
     }
 
 

@@ -127,6 +127,7 @@ CREATE TABLE IF NOT EXISTS anomalies (
 
 CREATE INDEX idx_anomalies_target ON anomalies(target_id, detected_at DESC);
 CREATE INDEX idx_anomalies_state ON anomalies(state) WHERE state = 'open';
+CREATE INDEX IF NOT EXISTS idx_anomalies_screenshot_id ON anomalies(screenshot_id);
 
 -- 告警渠道
 CREATE TABLE IF NOT EXISTS alert_channels (
