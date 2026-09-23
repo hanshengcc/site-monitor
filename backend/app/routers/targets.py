@@ -1,6 +1,7 @@
 import csv
 import io
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -10,6 +11,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
+from backend.app.config import settings
 from backend.app.database import get_db, AsyncSessionLocal
 from backend.app.models import Target, TargetStatus
 from backend.app.schemas import TargetCreate, TargetUpdate, TargetOut, TargetBatchCreate
@@ -145,6 +147,7 @@ async def export_targets(
             Target.check_interval,
             Target.enabled,
             Target.created_at,
+            TargetStatus.dns_server,
         )
         .outerjoin(TargetStatus, Target.id == TargetStatus.target_id)
     )
@@ -175,7 +178,7 @@ async def export_targets(
         writer.writerow([
             'ID', 'URL', '站点名称', '分组', '状态',
             '状态码', '响应延迟(ms)', '连续失败次数', '渲染异常',
-            '错误信息', '检测间隔(秒)', '是否启用', '创建时间',
+            '错误信息', 'DNS服务器', '检测间隔(秒)', '是否启用', '创建时间',
         ])
         yield output.getvalue().encode('utf-8')
 
@@ -193,6 +196,7 @@ async def export_targets(
                         r[7] or 0,
                         '是' if r[8] else '否',
                         r[9] or '',
+                        r[13] or '',
                         r[10] or 300,
                         '是' if r[11] else '否',
                         r[12].strftime('%Y-%m-%d %H:%M:%S') if r[12] else '',
@@ -239,6 +243,82 @@ async def update_target(target_id: int, body: TargetUpdate, db: AsyncSession = D
     return target
 
 
+@router.delete("/groups/{group_name}")
+async def delete_group(group_name: str, db: AsyncSession = Depends(get_db)):
+    """Delete a group and clean up all associated targets, checks, screenshots, and settings from database."""
+    import os
+    from loguru import logger
+    from backend.app.models import CheckResult, GroupSetting, Screenshot
+
+    # 1. Find all target IDs in this group
+    rows = await db.execute(select(Target.id).where(Target.group == group_name))
+    target_ids = [r[0] for r in rows.all()]
+
+    if target_ids:
+        from backend.app.models import CheckResult, GroupSetting, Screenshot, Snapshot
+
+        # 2. Clean up physical screenshot files on disk
+        try:
+            shot_rows = await db.execute(
+                select(Screenshot.file_path, Screenshot.thumb_path).where(
+                    Screenshot.target_id.in_(target_ids)
+                )
+            )
+            shots_dir = Path(settings.screenshots_dir)
+            for fpath, thumb in shot_rows.all():
+                if fpath:
+                    p = shots_dir / fpath
+                    if p.exists():
+                        try:
+                            p.unlink()
+                        except OSError:
+                            pass
+                if thumb:
+                    p = shots_dir / thumb
+                    if p.exists():
+                        try:
+                            p.unlink()
+                        except OSError:
+                            pass
+        except Exception as e:
+            logger.warning(f"Error cleaning screenshot files for group {group_name}: {e}")
+
+        # 3. Clean up physical snapshot files on disk
+        try:
+            snap_rows = await db.execute(
+                select(Snapshot.file_path).where(Snapshot.target_id.in_(target_ids))
+            )
+            snaps_dir = Path(settings.snapshots_dir)
+            for (fpath,) in snap_rows.all():
+                if fpath:
+                    p = snaps_dir / fpath
+                    if p.exists():
+                        try:
+                            p.unlink()
+                        except OSError:
+                            pass
+        except Exception as e:
+            logger.warning(f"Error cleaning snapshot files for group {group_name}: {e}")
+
+        # 4. Clean up check_results (partitioned table without FK cascade)
+        await db.execute(delete(CheckResult).where(CheckResult.target_id.in_(target_ids)))
+
+        # 5. Delete targets (cascades to target_status, screenshots, snapshots, baselines, anomalies)
+        await db.execute(delete(Target).where(Target.group == group_name))
+
+    # 6. Delete group_settings
+    from backend.app.models import GroupSetting
+    await db.execute(delete(GroupSetting).where(GroupSetting.group_name == group_name))
+
+    await db.commit()
+    return {
+        "ok": True,
+        "group": group_name,
+        "deleted_targets": len(target_ids),
+        "message": f"分组 [{group_name}] 及其关联的 {len(target_ids)} 个站点与历史数据已彻底从数据库清理",
+    }
+
+
 @router.delete("/{target_id}")
 async def delete_target(target_id: int, db: AsyncSession = Depends(get_db)):
     stmt = select(Target).where(Target.id == target_id)
@@ -247,9 +327,31 @@ async def delete_target(target_id: int, db: AsyncSession = Depends(get_db)):
     if not target:
         raise HTTPException(404, "Target not found")
 
-    # check_results 是分区表没有外键级联，需要手动删
     from sqlalchemy import delete as sa_delete
-    from backend.app.models import CheckResult
+    from backend.app.models import CheckResult, Screenshot, Snapshot
+
+    # Clean up physical files on disk
+    try:
+        shot_rows = await db.execute(select(Screenshot.file_path, Screenshot.thumb_path).where(Screenshot.target_id == target_id))
+        shots_dir = Path(settings.screenshots_dir)
+        for fpath, thumb in shot_rows.all():
+            if fpath and (shots_dir / fpath).exists():
+                try: (shots_dir / fpath).unlink()
+                except OSError: pass
+            if thumb and (shots_dir / thumb).exists():
+                try: (shots_dir / thumb).unlink()
+                except OSError: pass
+
+        snap_rows = await db.execute(select(Snapshot.file_path).where(Snapshot.target_id == target_id))
+        snaps_dir = Path(settings.snapshots_dir)
+        for (fpath,) in snap_rows.all():
+            if fpath and (snaps_dir / fpath).exists():
+                try: (snaps_dir / fpath).unlink()
+                except OSError: pass
+    except Exception as e:
+        logger.warning(f"Error cleaning files for target {target_id}: {e}")
+
+    # check_results 是分区表没有外键级联，需要手动删
     await db.execute(sa_delete(CheckResult).where(CheckResult.target_id == target_id))
 
     await db.delete(target)

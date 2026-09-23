@@ -174,6 +174,20 @@ async def _do_take_screenshot(target_id: int, url: str) -> Optional[dict]:
         page_title = await page.title()
         dom_text_length = await page.evaluate("() => document.body ? document.body.innerText.length : 0")
 
+        # Simultaneously capture webpage snapshot (Wayback machine snapshot)
+        try:
+            from backend.app.snapshoter import _save_snapshot_bytes
+            html_content = await page.content()
+            asyncio.create_task(_save_snapshot_bytes(
+                target_id=target_id,
+                url=url,
+                html_content=html_content,
+                page_title=page_title,
+                dom_text_length=dom_text_length,
+            ))
+        except Exception as e:
+            logger.debug(f"[{target_id}] Auto-snapshot during screenshot skipped: {e}")
+
         # Take screenshot
         await page.screenshot(path=str(filepath), full_page=False, type="jpeg", quality=80)
 

@@ -17,12 +17,25 @@
           <el-option label="健康" value="ok" /><el-option label="异常" value="fail" /><el-option label="未知" value="unknown" />
         </el-select>
       </el-col>
-      <el-col :span="3" v-if="filterGroup">
+      <el-col :span="6" v-if="filterGroup">
         <el-button size="small" type="warning" plain @click="checkCurrentGroup">
           <el-icon><Refresh /></el-icon> 检测该组
         </el-button>
+        <el-popconfirm
+          :title="`确定彻底删除分组 [${filterGroup}] 及其所有站点与历史数据？`"
+          confirm-button-text="删除"
+          cancel-button-text="取消"
+          confirm-button-type="danger"
+          @confirm="deleteCurrentGroup"
+        >
+          <template #reference>
+            <el-button size="small" type="danger" plain style="margin-left: 8px">
+              <el-icon><Delete /></el-icon> 删除该组
+            </el-button>
+          </template>
+        </el-popconfirm>
       </el-col>
-      <el-col :span="filterGroup ? 9 : 12" style="text-align: right">
+      <el-col :span="filterGroup ? 6 : 12" style="text-align: right">
         <el-button type="primary" @click="showAdd = true"><el-icon><Plus /></el-icon> 添加</el-button>
         <el-button @click="showBatch = true"><el-icon><Upload /></el-icon> 批量导入</el-button>
         <el-button type="success" @click="doExport"><el-icon><Download /></el-icon> 导出</el-button>
@@ -33,7 +46,7 @@
     <el-card>
       <el-table :data="targets" stripe size="small" v-loading="loading" style="width: 100%">
         <el-table-column prop="id" label="ID" width="60" />
-        <el-table-column label="站点" min-width="280">
+        <el-table-column label="站点" min-width="260">
           <template #default="{ row }">
             <div>
               <router-link :to="`/targets/${row.id}`" style="color: #409eff; text-decoration: none; font-weight: 500">
@@ -44,6 +57,14 @@
           </template>
         </el-table-column>
         <el-table-column prop="group" label="分组" width="100" />
+        <el-table-column label="DNS服务器" min-width="160" show-overflow-tooltip>
+          <template #default="{ row }">
+            <span v-if="row.status?.dns_server" style="font-family: monospace; font-size: 12px; color: #409eff">
+              {{ row.status.dns_server }}
+            </span>
+            <span v-else style="color: #c0c4cc">-</span>
+          </template>
+        </el-table-column>
         <el-table-column label="状态" width="80" align="center">
           <template #default="{ row }">
             <el-tag v-if="row.status?.is_ok === true" type="success" size="small">正常</el-tag>
@@ -79,9 +100,10 @@
             <el-switch v-model="row.enabled" size="small" @change="toggleTarget(row)" />
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="180" align="center">
+        <el-table-column label="操作" width="220" align="center">
           <template #default="{ row }">
             <el-button link size="small" @click="doCheck(row)" :loading="checkingId === row.id">检测</el-button>
+            <el-button link size="small" type="primary" @click="doSnapshot(row)" :loading="snapshottingId === row.id">快照</el-button>
             <el-button link size="small" @click="doShot(row)" :loading="shottingId === row.id">截图</el-button>
             <el-button link size="small" type="danger" @click="doDelete(row)">删除</el-button>
           </template>
@@ -98,10 +120,11 @@
 
     <!-- Add Dialog -->
     <el-dialog v-model="showAdd" title="添加监控目标" width="500px">
-      <el-form :model="addForm" label-width="80px">
+      <el-form :model="addForm" label-width="90px">
         <el-form-item label="URL"><el-input v-model="addForm.url" placeholder="https://example.com" /></el-form-item>
         <el-form-item label="名称"><el-input v-model="addForm.name" placeholder="可选" /></el-form-item>
         <el-form-item label="分组"><el-input v-model="addForm.group" /></el-form-item>
+        <el-form-item label="预期DNS"><el-input v-model="addForm.expect_dns_server" placeholder="例如: dnspod.com 或 ns1.cloudflare.com" /></el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="showAdd = false">取消</el-button>
@@ -141,13 +164,14 @@ const filterStatus = ref('')
 const groups = ref([])
 
 const showAdd = ref(false)
-const addForm = ref({ url: '', name: '', group: 'default' })
+const addForm = ref({ url: '', name: '', group: 'default', expect_dns_server: '' })
 
 const showBatch = ref(false)
 const batchForm = ref({ text: '', group: 'default' })
 const importing = ref(false)
 const checkingId = ref(null)
 const shottingId = ref(null)
+const snapshottingId = ref(null)
 
 async function loadData() {
   loading.value = true
@@ -178,8 +202,9 @@ async function doAdd() {
   await api.createTarget(addForm.value)
   ElMessage.success('添加成功')
   showAdd.value = false
-  addForm.value = { url: '', name: '', group: 'default' }
+  addForm.value = { url: '', name: '', group: 'default', expect_dns_server: '' }
   loadData()
+  loadGroups()
 }
 
 async function doBatchImport() {
@@ -210,6 +235,20 @@ async function checkCurrentGroup() {
   }
 }
 
+async function deleteCurrentGroup() {
+  if (!filterGroup.value) return
+  const groupToDelete = filterGroup.value
+  try {
+    const { data } = await api.deleteGroup(groupToDelete)
+    ElMessage.success(`分组 [${groupToDelete}] 已彻底删除 (清理 ${data.deleted_targets} 个站点)`)
+    filterGroup.value = ''
+    await loadGroups()
+    await loadData()
+  } catch (e) {
+    ElMessage.error('删除分组失败: ' + (e.response?.data?.detail || e.message))
+  }
+}
+
 function doExport() {
   const url = api.exportTargets({
     search: search.value || undefined,
@@ -234,6 +273,24 @@ async function doCheck(row) {
     ElMessage.error('检测失败: ' + (e.message || '超时'))
   }
   checkingId.value = null
+}
+
+async function doSnapshot(row) {
+  snapshottingId.value = row.id
+  try {
+    ElMessage.info('正在抓取网页时光机快照...')
+    const { data } = await api.triggerSnapshot(row.id)
+    if (data.error) {
+      ElMessage.error('快照抓取失败: ' + data.error)
+    } else {
+      ElMessage.success(`快照完成: ${(data.file_size / 1024).toFixed(1)}KB (${data.has_changed ? '内容变更' : '内容无变化'})`)
+      loadData()
+    }
+  } catch (e) {
+    ElMessage.error('快照失败: ' + (e.response?.data?.detail || e.message || '超时'))
+  } finally {
+    snapshottingId.value = null
+  }
 }
 
 async function doShot(row) {

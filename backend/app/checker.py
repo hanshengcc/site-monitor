@@ -48,6 +48,7 @@ async def check_single(
     url: str,
     expect_status: int = 200,
     expect_keyword: Optional[str] = None,
+    expect_dns_server: Optional[str] = None,
     request_timeout: int = 15,
     follow_redirects: bool = True,
     custom_headers: Optional[dict] = None,
@@ -58,8 +59,12 @@ async def check_single(
     """
     result = await _do_check(
         client, target_id, url,
-        expect_status, expect_keyword,
-        request_timeout, follow_redirects, custom_headers,
+        expect_status=expect_status,
+        expect_keyword=expect_keyword,
+        expect_dns_server=expect_dns_server,
+        request_timeout=request_timeout,
+        follow_redirects=follow_redirects,
+        custom_headers=custom_headers,
     )
 
     # ---- SSL certificate check (for HTTPS URLs that got HTTP 200) ----
@@ -84,8 +89,12 @@ async def check_single(
         logger.debug(f"[{target_id}] SSL error, retrying with HTTP: {http_url}")
         fallback = await _do_check(
             client, target_id, http_url,
-            expect_status, expect_keyword,
-            request_timeout, follow_redirects, custom_headers,
+            expect_status=expect_status,
+            expect_keyword=expect_keyword,
+            expect_dns_server=expect_dns_server,
+            request_timeout=request_timeout,
+            follow_redirects=follow_redirects,
+            custom_headers=custom_headers,
         )
         if fallback["is_ok"]:
             fallback["error"] = None
@@ -93,21 +102,6 @@ async def check_single(
         else:
             # Both failed: keep original SSL error but note fallback attempted
             result["error"] = f"ssl_error (HTTP fallback also failed): {result['error']}"
-
-    # When HTTP check fails, run DNS-based domain status detection
-    # to distinguish "site down" from "domain expired/parked"
-    if not result["is_ok"]:
-        try:
-            from backend.app.domain_detector import detect_domain_status
-            verdict = await detect_domain_status(url, dns_timeout=5.0)
-            if verdict.is_parked_or_expired:
-                signals_str = "; ".join(s.detail for s in verdict.signals[:3])
-                result["error"] = f"域名过期/注册商处 [{verdict.category}] ({signals_str})"
-            elif verdict.is_dns_not_found:
-                signals_str = "; ".join(s.detail for s in verdict.signals[:3])
-                result["error"] = f"DNS无法解析 [{verdict.category}] ({signals_str})"
-        except Exception as e:
-            logger.debug(f"[{target_id}] Domain detection failed: {e}")
 
     return result
 
@@ -118,11 +112,14 @@ async def _do_check(
     url: str,
     expect_status: int = 200,
     expect_keyword: Optional[str] = None,
+    expect_dns_server: Optional[str] = None,
     request_timeout: int = 15,
     follow_redirects: bool = True,
     custom_headers: Optional[dict] = None,
 ) -> dict:
-    """Perform a single HTTP check."""
+    """Perform health check based on domain DNS server and HTTP status.
+    Cancels body string matching and relies on authoritative DNS servers.
+    """
     start = time.monotonic()
     result = {
         "target_id": target_id,
@@ -131,52 +128,84 @@ async def _do_check(
         "latency_ms": None,
         "is_ok": False,
         "error": None,
+        "dns_server": None,
     }
     headers = dict(custom_headers) if custom_headers else {}
-    try:
-        resp = await client.get(
-            url, follow_redirects=follow_redirects,
-            timeout=request_timeout, headers=headers,
-        )
-        elapsed_ms = int((time.monotonic() - start) * 1000)
-        result["status_code"] = resp.status_code
-        result["latency_ms"] = elapsed_ms
-        if resp.status_code != expect_status:
-            result["error"] = f"expected {expect_status}, got {resp.status_code}"
+
+    from backend.app.domain_detector import detect_domain_status, DomainVerdict
+
+    # Perform HTTP request and authoritative DNS server inspection concurrently
+    http_task = client.get(
+        url, follow_redirects=follow_redirects,
+        timeout=request_timeout, headers=headers,
+    )
+    dns_task = detect_domain_status(
+        url,
+        expect_dns_server=expect_dns_server,
+        dns_timeout=min(5.0, max(2.0, float(request_timeout) / 2)),
+    )
+
+    http_res, dns_verdict = await asyncio.gather(
+        http_task, dns_task, return_exceptions=True
+    )
+    elapsed_ms = int((time.monotonic() - start) * 1000)
+    result["latency_ms"] = elapsed_ms
+
+    if isinstance(dns_verdict, DomainVerdict):
+        result["dns_server"] = dns_verdict.dns_server
+
+        # 1. DNS does not exist (NXDOMAIN)
+        if dns_verdict.is_dns_not_found:
+            result["is_ok"] = False
+            result["error"] = dns_verdict.summary or "DNS无法解析 (域名不存在/NXDOMAIN)"
             return result
-        if expect_keyword:
-            if expect_keyword not in resp.text[:50000]:
-                result["error"] = f"keyword '{expect_keyword}' not found"
-                return result
-        # ---- Domain expired / parking detection (multi-signal) ----
-        from backend.app.domain_detector import detect_domain_status, check_content_signals
-        # Quick content check first (cheap); full DNS check only if content is suspicious
-        content_signal = check_content_signals(resp.text)
-        if content_signal:
-            # Content looks suspicious → do full multi-signal DNS check
-            verdict = await detect_domain_status(url, response_body=resp.text, dns_timeout=5.0)
-            if verdict.is_parked_or_expired:
-                result["is_ok"] = False
-                signals_str = "; ".join(s.detail for s in verdict.signals[:3])
-                result["error"] = f"域名过期/注册商处 [{verdict.category}] ({signals_str})"
-                return result
-        result["is_ok"] = True
-    except httpx.TimeoutException:
-        result["latency_ms"] = int((time.monotonic() - start) * 1000)
-        result["error"] = "timeout"
-    except httpx.ConnectError as e:
-        result["latency_ms"] = int((time.monotonic() - start) * 1000)
-        err_str = str(e)
-        if _is_ssl_error(e):
+
+        # 2. DNS server matches known parking / expired nameserver, or CNAME/IP parking
+        if dns_verdict.is_parked_or_expired:
+            result["is_ok"] = False
+            result["error"] = dns_verdict.summary or "域名已过期或停放"
+            return result
+
+        # 3. Target / Group expected DNS server mismatch
+        if dns_verdict.category == "dns_mismatch":
+            result["is_ok"] = False
+            result["error"] = dns_verdict.summary
+            return result
+
+    # 4. HTTP response / connection failure evaluation
+    if isinstance(http_res, Exception):
+        result["is_ok"] = False
+        err_str = str(http_res)
+        if isinstance(http_res, httpx.TimeoutException):
+            result["error"] = "timeout"
+        elif isinstance(http_res, httpx.ConnectError):
+            if _is_ssl_error(http_res):
+                result["error"] = f"ssl_error: {err_str[:200]}"
+            else:
+                result["error"] = f"connect_error: {err_str[:200]}"
+        elif isinstance(http_res, ssl.SSLError):
             result["error"] = f"ssl_error: {err_str[:200]}"
         else:
-            result["error"] = f"connect_error: {err_str[:200]}"
-    except ssl.SSLError as e:
-        result["latency_ms"] = int((time.monotonic() - start) * 1000)
-        result["error"] = f"ssl_error: {str(e)[:200]}"
-    except Exception as e:
-        result["latency_ms"] = int((time.monotonic() - start) * 1000)
-        result["error"] = f"{type(e).__name__}: {str(e)[:200]}"
+            result["error"] = f"{type(http_res).__name__}: {err_str[:200]}"
+        return result
+
+    resp = http_res
+    result["status_code"] = resp.status_code
+
+    if resp.status_code != expect_status:
+        result["is_ok"] = False
+        result["error"] = f"expected {expect_status}, got {resp.status_code}"
+        return result
+
+    if expect_keyword:
+        if expect_keyword not in resp.text[:50000]:
+            result["is_ok"] = False
+            result["error"] = f"keyword '{expect_keyword}' not found"
+            return result
+
+    # Domain DNS is healthy and HTTP returned expected status!
+    result["is_ok"] = True
+    result["error"] = None
     return result
 
 
@@ -217,8 +246,9 @@ async def _flush_buffer(buffer: list):
     try:
         async with AsyncSessionLocal() as session:
             for r in buffer:
-                # Extract ssl_info before saving CheckResult (CheckResult doesn't have it)
+                # Extract non-CheckResult fields before saving CheckResult
                 ssl_info = r.pop("ssl_info", None)
+                dns_server = r.pop("dns_server", None)
 
                 session.add(CheckResult(**r))
 
@@ -243,6 +273,9 @@ async def _flush_buffer(buffer: list):
                         else text("target_status.consecutive_fails + 1")
                     ),
                 }
+                if dns_server:
+                    upsert_vals["dns_server"] = dns_server
+                    update_set["dns_server"] = dns_server
 
                 # Add SSL cert info if present
                 if ssl_info:
@@ -471,6 +504,8 @@ async def run_checks(group: Optional[str] = None):
                    or gc.get('request_timeout')
                    or settings.check_timeout)
         follow = getattr(target, 'follow_redirects', True)
+        expect_dns = (getattr(target, 'expect_dns_server', None)
+                      or gc.get('expect_dns_server'))
         extra_headers = getattr(target, 'request_headers', None) or {}
         headers = {"User-Agent": ua}
         headers.update(extra_headers)
@@ -489,6 +524,7 @@ async def run_checks(group: Optional[str] = None):
                     client, target.id, url,
                     expect_status=target.expect_status,
                     expect_keyword=target.expect_keyword,
+                    expect_dns_server=expect_dns,
                     request_timeout=timeout,
                     follow_redirects=follow if follow is not None else True,
                     custom_headers=headers,

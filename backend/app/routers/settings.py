@@ -34,6 +34,7 @@ async def update_global_settings(body: dict, db: AsyncSession = Depends(get_db))
     mapping = {
         "check_interval": "check_interval_minutes",
         "screenshot_interval": "screenshot_interval_minutes",
+        "snapshot_interval": "snapshot_interval_minutes",
         "default_timeout": "check_timeout",
         "max_concurrent_checks": "max_concurrent_checks",
         "playwright_concurrency": "playwright_concurrency",
@@ -44,13 +45,13 @@ async def update_global_settings(body: dict, db: AsyncSession = Depends(get_db))
             val = body[db_key]
             if isinstance(val, str) and val.isdigit():
                 val = int(val)
-            if db_key in ("check_interval", "screenshot_interval"):
+            if db_key in ("check_interval", "screenshot_interval", "snapshot_interval"):
                 val = max(1, int(val) // 60) if int(val) >= 60 else 1
             else:
                 val = int(val)
             setattr(settings, attr, val)
 
-    if "check_interval" in body or "screenshot_interval" in body:
+    if any(k in body for k in ("check_interval", "screenshot_interval", "snapshot_interval")):
         from backend.app.scheduler import restart_scheduler
         restart_scheduler()
 
@@ -64,6 +65,8 @@ class GroupSettingUpdate(BaseModel):
     rate_limit: Optional[int] = None
     request_timeout: Optional[int] = None
     user_agent: Optional[str] = None
+    expect_dns_server: Optional[str] = None
+    snapshot_interval: Optional[int] = None
     enabled: Optional[bool] = None
     note: Optional[str] = None
 
@@ -103,6 +106,8 @@ async def list_group_settings(db: AsyncSession = Depends(get_db)):
             "rate_limit": gs.rate_limit if (gs and gs.rate_limit is not None) else 0,
             "request_timeout": gs.request_timeout if gs else 15,
             "user_agent": gs.user_agent if gs else None,
+            "expect_dns_server": gs.expect_dns_server if gs else None,
+            "snapshot_interval": gs.snapshot_interval if (gs and gs.snapshot_interval is not None) else 21600,
             "enabled": gs.enabled if gs else True,
             "note": gs.note if gs else None,
         })
@@ -148,3 +153,11 @@ async def batch_update_group_settings(
         await db.execute(stmt)
     await db.commit()
     return {"ok": True, "updated": len(body)}
+
+
+@router.delete("/groups/{group_name}")
+async def delete_group_setting(group_name: str, db: AsyncSession = Depends(get_db)):
+    """Delete a group and completely clean up all associated data from the database."""
+    from backend.app.routers.targets import delete_group
+    return await delete_group(group_name, db)
+

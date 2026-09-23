@@ -63,6 +63,14 @@ async def trigger_screenshot_all():
     return {"message": "Screenshot round triggered"}
 
 
+@router.post("/snapshot-all")
+async def trigger_snapshot_all():
+    """Manually trigger a full snapshot round (async background)."""
+    from backend.app.snapshoter import run_snapshots
+    asyncio.create_task(run_snapshots())
+    return {"message": "Snapshot round triggered"}
+
+
 @router.post("/check/{target_id}")
 async def trigger_single_check(target_id: int, db: AsyncSession = Depends(get_db)):
     """Check a single target immediately and save result."""
@@ -77,10 +85,16 @@ async def trigger_single_check(target_id: int, db: AsyncSession = Depends(get_db
     async with httpx.AsyncClient(
         headers={"User-Agent": "SiteMonitor/1.0"}, verify=_make_ssl_context()
     ) as client:
-        result = await check_single(client, target.id, target.url, target.expect_status, target.expect_keyword)
+        result = await check_single(
+            client, target.id, target.url,
+            expect_status=target.expect_status,
+            expect_keyword=target.expect_keyword,
+            expect_dns_server=getattr(target, 'expect_dns_server', None),
+        )
 
-    # Extract ssl_info before saving (CheckResult doesn't have it)
+    # Extract non-CheckResult fields before saving (CheckResult doesn't have them)
     ssl_info = result.pop("ssl_info", None)
+    dns_server = result.pop("dns_server", None)
 
     # Save check result to DB
     db.add(CheckResult(**result))
@@ -106,6 +120,9 @@ async def trigger_single_check(target_id: int, db: AsyncSession = Depends(get_db
             else text("target_status.consecutive_fails + 1")
         ),
     }
+    if dns_server:
+        upsert_vals["dns_server"] = dns_server
+        update_set["dns_server"] = dns_server
     if ssl_info:
         ssl_not_after = None
         if ssl_info.get("ssl_not_after"):
@@ -229,15 +246,32 @@ async def trigger_single_screenshot(target_id: int, db: AsyncSession = Depends(g
     return result
 
 
+@router.post("/snapshot/{target_id}")
+async def trigger_single_snapshot(target_id: int, db: AsyncSession = Depends(get_db)):
+    """Take a webpage snapshot of a single target immediately."""
+    stmt = select(Target).where(Target.id == target_id)
+    row = await db.execute(stmt)
+    target = row.scalar_one_or_none()
+    if not target:
+        raise HTTPException(404, "Target not found")
+
+    from backend.app.snapshoter import take_snapshot
+    result = await take_snapshot(target.id, target.url)
+    if result is None:
+        return {"error": "Snapshot failed"}
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Retry-failed: re-check failed targets with strict group rate limiting
 # ---------------------------------------------------------------------------
 
 # Patterns that indicate domain-level issues (should NOT be retried)
 _DOMAIN_EXPIRED_PATTERNS = [
-    "域名过期/注册商处",
+    "域名已过期或停放", "域名过期", "域名停放", "域名过期/注册商处",
     "domain_expired", "domain_parked", "domain_not_found", "registrar_held",
-    "DNS无法解析", "NXDOMAIN",
+    "DNS无法解析", "NXDOMAIN", "dns服务器不匹配",
 ]
 
 
@@ -356,6 +390,8 @@ async def _run_retry_failed(group: str = None):
         group_sem = group_sems.get(target.group, asyncio.Semaphore(default_group_concurrency))
         limiter = group_rate_limiters.get(target.group)
 
+        expect_dns = (getattr(target, 'expect_dns_server', None)
+                      or gc.get('expect_dns_server'))
         async with group_sem:
             async with global_sem:
                 if limiter:
@@ -365,6 +401,7 @@ async def _run_retry_failed(group: str = None):
                     client, target.id, url,
                     expect_status=target.expect_status,
                     expect_keyword=target.expect_keyword,
+                    expect_dns_server=expect_dns,
                     request_timeout=timeout,
                     follow_redirects=follow if follow is not None else True,
                     custom_headers=headers,

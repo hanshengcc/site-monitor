@@ -48,6 +48,7 @@ export default {
   deleteTarget: (id) => api.delete(`/targets/${id}`),
   toggleTarget: (id) => api.post(`/targets/${id}/toggle`),
   getGroups: () => api.get('/targets/groups/list'),
+  deleteGroup: (group) => api.delete(`/targets/groups/${encodeURIComponent(group)}`),
 
   // Results
   getResults: (targetId, params) => api.get(`/results/${targetId}`, { params }),
@@ -57,6 +58,17 @@ export default {
   // Screenshots
   getScreenshots: (targetId, params) => api.get(`/screenshots/${targetId}`, { params }),
   getScreenshotUrl: (id, thumb = false) => `/api/screenshots/image/${id}?thumb=${thumb}`,
+
+  // Snapshots (网页时光机)
+  getSnapshots: (targetId, params) => api.get(`/snapshots/${targetId}`, { params }),
+  getSnapshotDetail: (id) => api.get(`/snapshots/detail/${id}`),
+  getSnapshotViewUrl: (id) => `/api/snapshots/view/${id}`,
+  getSnapshotRawUrl: (id) => `/api/snapshots/raw/${id}`,
+  getSnapshotDownloadUrl: (id) => `/api/snapshots/download/${id}`,
+  getSnapshotDiff: (id) => api.get(`/snapshots/diff/${id}`),
+  triggerSnapshot: (id) => api.post(`/tasks/snapshot/${id}`),
+  triggerSnapshotAll: () => api.post('/tasks/snapshot-all'),
+  deleteSnapshot: (id) => api.delete(`/snapshots/${id}`),
 
   // Anomalies
   getAnomalies: (params) => api.get('/anomalies', { params }),

@@ -15,6 +15,7 @@ scheduler = AsyncIOScheduler()
 # Lock to prevent overlapping runs
 _check_running = asyncio.Lock()
 _shot_running = asyncio.Lock()
+_snap_running = asyncio.Lock()
 
 
 async def _safe_run_checks():
@@ -55,6 +56,23 @@ async def _safe_run_screenshots():
         logger.exception(f"Alert dispatch failed: {e}")
 
 
+async def _safe_run_snapshots():
+    if _snap_running.locked():
+        logger.warning("Previous snapshot round still running, skip.")
+        return
+    async with _snap_running:
+        try:
+            from backend.app.snapshoter import run_snapshots
+            await run_snapshots()
+        except Exception as e:
+            logger.exception(f"Snapshot round failed: {e}")
+        finally:
+            try:
+                await close_browser()
+            except Exception:
+                pass
+
+
 async def run_daily_maintenance():
     """Daily maintenance:
     1. Ensure future monthly partitions exist.
@@ -63,7 +81,7 @@ async def run_daily_maintenance():
     """
     logger.info("Running daily maintenance task...")
     from backend.app.database import AsyncSessionLocal
-    from backend.app.models import Screenshot, Baseline, CheckResult
+    from backend.app.models import Screenshot, Baseline, CheckResult, Snapshot
     from sqlalchemy import text, select, delete
     from datetime import datetime, timedelta, timezone
     from pathlib import Path
@@ -122,6 +140,7 @@ async def run_daily_maintenance():
                     if tp.exists():
                         try:
                             tp.unlink()
+                            deleted_files += 1
                         except OSError:
                             pass
                 await session.delete(shot)
@@ -131,6 +150,33 @@ async def run_daily_maintenance():
                 logger.info(f"Cleaned up {len(old_shots)} old normal screenshots ({deleted_files} files deleted).")
         except Exception as e:
             logger.warning(f"Failed to clean old screenshots: {e}")
+
+        # 4. Clean old unchanged snapshots (>30 days, preserving changed snapshots for history)
+        try:
+            snap_stmt = select(Snapshot).where(
+                Snapshot.taken_at < cutoff_30d,
+                Snapshot.has_changed == False,
+            ).limit(1000)
+            old_snaps = (await session.execute(snap_stmt)).scalars().all()
+            snaps_dir = Path(settings.snapshots_dir)
+            deleted_snaps = 0
+
+            for snap in old_snaps:
+                if snap.file_path:
+                    sp = snaps_dir / snap.file_path
+                    if sp.exists():
+                        try:
+                            sp.unlink()
+                            deleted_snaps += 1
+                        except OSError:
+                            pass
+                await session.delete(snap)
+
+            await session.commit()
+            if old_snaps:
+                logger.info(f"Cleaned up {len(old_snaps)} old unchanged snapshots ({deleted_snaps} files deleted).")
+        except Exception as e:
+            logger.warning(f"Failed to clean old snapshots: {e}")
 
 
 def start_scheduler():
@@ -155,6 +201,14 @@ def start_scheduler():
     )
 
     scheduler.add_job(
+        _safe_run_snapshots,
+        trigger=IntervalTrigger(minutes=settings.snapshot_interval_minutes),
+        id="snapshots",
+        name="Page Snapshots (Wayback Machine)",
+        replace_existing=True,
+    )
+
+    scheduler.add_job(
         run_daily_maintenance,
         trigger=IntervalTrigger(hours=24),
         id="daily_maintenance",
@@ -167,6 +221,7 @@ def start_scheduler():
     logger.info(
         f"Scheduler started: checks every {settings.check_interval_minutes}min (first run immediate), "
         f"screenshots every {settings.screenshot_interval_minutes}min, "
+        f"snapshots every {settings.snapshot_interval_minutes}min, "
         f"maintenance every 24h"
     )
 

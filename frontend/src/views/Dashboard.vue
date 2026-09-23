@@ -20,16 +20,14 @@
     </div>
 
     <!-- Stats Cards -->
-    <el-row :gutter="16" style="margin-bottom: 20px">
-      <el-col :span="4" v-for="card in cards" :key="card.label">
-        <el-card shadow="hover" style="text-align: center">
-          <div style="font-size: 28px; font-weight: 700" :style="{ color: card.color }">
-            {{ card.value }}
-          </div>
-          <div style="color: #999; margin-top: 4px">{{ card.label }}</div>
-        </el-card>
-      </el-col>
-    </el-row>
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 16px; margin-bottom: 20px">
+      <el-card v-for="card in cards" :key="card.label" shadow="hover" style="text-align: center">
+        <div style="font-size: 28px; font-weight: 700" :style="{ color: card.color }">
+          {{ card.value }}
+        </div>
+        <div style="color: #999; margin-top: 4px">{{ card.label }}</div>
+      </el-card>
+    </div>
 
     <!-- Group Summary -->
     <el-card style="margin-bottom: 20px">
@@ -120,11 +118,24 @@
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="110" align="center" fixed="right">
+        <el-table-column label="操作" width="180" align="center" fixed="right">
           <template #default="{ row }">
             <el-button size="small" type="primary" link @click="checkGroup(row.group)">
               <el-icon><Refresh /></el-icon> 检测此组
             </el-button>
+            <el-popconfirm
+              :title="`确定彻底删除分组 [${row.group}] 及其所有站点与历史数据？`"
+              confirm-button-text="删除"
+              cancel-button-text="取消"
+              confirm-button-type="danger"
+              @confirm="deleteGroup(row.group)"
+            >
+              <template #reference>
+                <el-button size="small" type="danger" link>
+                  <el-icon><Delete /></el-icon> 删除
+                </el-button>
+              </template>
+            </el-popconfirm>
           </template>
         </el-table-column>
       </el-table>
@@ -370,6 +381,16 @@ async function checkGroup(group) {
   }
 }
 
+async function deleteGroup(group) {
+  try {
+    const { data } = await api.deleteGroup(group)
+    ElMessage.success(`分组 [${group}] 已彻底删除 (清理 ${data.deleted_targets} 个站点)`)
+    await loadData()
+  } catch (e) {
+    ElMessage.error('删除分组失败: ' + (e.response?.data?.detail || e.message))
+  }
+}
+
 async function loadSslData() {
   const filterVal = sslFilter.value === 'all' ? undefined : sslFilter.value
   try {
@@ -417,6 +438,7 @@ const cards = computed(() => [
   { label: '异常', value: stats.value.unhealthy || 0, color: '#f56c6c' },
   { label: '待检测', value: stats.value.unknown || 0, color: '#909399' },
   { label: '今日截图', value: stats.value.screenshots_today || 0, color: '#e6a23c' },
+  { label: '今日快照', value: stats.value.snapshots_today || 0, color: '#9c27b0' },
 ])
 
 function formatTime(t) {

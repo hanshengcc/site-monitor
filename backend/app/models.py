@@ -24,8 +24,10 @@ class Target(Base):
     tags = Column(ARRAY(Text), default=[])
     check_interval = Column(Integer, default=300)
     shot_interval = Column(Integer, default=21600)
+    snapshot_interval = Column(Integer, default=21600)
     expect_status = Column(SmallInteger, default=200)
     expect_keyword = Column(Text)
+    expect_dns_server = Column(Text)
     protocol = Column(Text, default="https")
     user_agent = Column(Text)
     request_timeout = Column(Integer, default=15)
@@ -54,6 +56,8 @@ class GroupSetting(Base):
     rate_limit = Column(Integer, default=0)  # 0 or None means unlimited QPS
     request_timeout = Column(Integer, default=15)
     user_agent = Column(Text)
+    expect_dns_server = Column(Text)
+    snapshot_interval = Column(Integer, default=21600)
     enabled = Column(Boolean, default=True)
     note = Column(Text)
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
@@ -101,6 +105,23 @@ class Baseline(Base):
     set_by = Column(Text, default="auto")
 
 
+class Snapshot(Base):
+    __tablename__ = "snapshots"
+
+    id = Column(BigInteger, primary_key=True)
+    target_id = Column(Integer, ForeignKey("targets.id", ondelete="CASCADE"), nullable=False)
+    taken_at = Column(DateTime(timezone=True), default=utc_now)
+    file_path = Column(Text, nullable=False)
+    file_size = Column(Integer)             # Uncompressed size in bytes
+    compressed_size = Column(Integer)       # Compressed file size in bytes
+    content_hash = Column(String(64))       # SHA256 of uncompressed HTML
+    page_title = Column(Text)
+    http_status = Column(SmallInteger)
+    dom_text_length = Column(Integer, default=0)
+    has_changed = Column(Boolean, default=True)  # True if content changed vs previous snapshot
+    headers = Column(JSON, default={})
+
+
 class Anomaly(Base):
     __tablename__ = "anomalies"
 
@@ -138,6 +159,8 @@ class TargetStatus(Base):
     last_error = Column(Text)
     last_screenshot_id = Column(BigInteger)
     last_screenshot_at = Column(DateTime(timezone=True))
+    last_snapshot_id = Column(BigInteger)
+    last_snapshot_at = Column(DateTime(timezone=True))
     has_anomaly = Column(Boolean, default=False)
     consecutive_fails = Column(Integer, default=0)
     # SSL certificate info
@@ -149,5 +172,6 @@ class TargetStatus(Base):
     ssl_days_left = Column(Integer)
     ssl_warning = Column(Text)
     ssl_checked_at = Column(DateTime(timezone=True))
+    dns_server = Column(Text)
 
     target = relationship("Target", back_populates="status")

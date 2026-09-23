@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS targets (
     shot_interval   INTEGER DEFAULT 21600,      -- 截图间隔(秒) 默认6h
     expect_status   SMALLINT DEFAULT 200,
     expect_keyword  TEXT,
+    expect_dns_server TEXT,
     protocol        TEXT DEFAULT 'https',
     user_agent      TEXT,
     request_timeout INTEGER DEFAULT 15,
@@ -25,6 +26,7 @@ CREATE TABLE IF NOT EXISTS targets (
 );
 
 -- 兼容老数据库字段迁移
+ALTER TABLE targets ADD COLUMN IF NOT EXISTS expect_dns_server TEXT;
 ALTER TABLE targets ADD COLUMN IF NOT EXISTS protocol TEXT DEFAULT 'https';
 ALTER TABLE targets ADD COLUMN IF NOT EXISTS user_agent TEXT;
 ALTER TABLE targets ADD COLUMN IF NOT EXISTS request_timeout INTEGER DEFAULT 15;
@@ -155,9 +157,12 @@ CREATE TABLE IF NOT EXISTS target_status (
     ssl_not_after   TIMESTAMPTZ,
     ssl_days_left   INTEGER,
     ssl_warning     TEXT,
-    ssl_checked_at  TIMESTAMPTZ
+    ssl_checked_at  TIMESTAMPTZ,
+    dns_server      TEXT
 );
 
+ALTER TABLE target_status ADD COLUMN IF NOT EXISTS dns_server TEXT;
+CREATE INDEX IF NOT EXISTS idx_target_status_dns_server ON target_status(dns_server);
 CREATE INDEX IF NOT EXISTS idx_target_status_is_ok ON target_status(is_ok);
 CREATE INDEX IF NOT EXISTS idx_target_status_ssl_valid ON target_status(ssl_valid);
 CREATE INDEX IF NOT EXISTS idx_target_status_ssl_days_left ON target_status(ssl_days_left ASC NULLS LAST);
@@ -177,10 +182,37 @@ CREATE TABLE IF NOT EXISTS group_settings (
     rate_limit      INTEGER DEFAULT 0,          -- 每秒最大请求数(QPS限制, 0表示不限制)
     request_timeout INTEGER DEFAULT 15,
     user_agent      TEXT,
+    expect_dns_server TEXT,
     enabled         BOOLEAN DEFAULT TRUE,
     note            TEXT,
     updated_at      TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- 网页快照 (时光机)
+CREATE TABLE IF NOT EXISTS snapshots (
+    id              BIGSERIAL PRIMARY KEY,
+    target_id       INTEGER NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
+    taken_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    file_path       TEXT NOT NULL,
+    file_size       INTEGER,
+    compressed_size INTEGER,
+    content_hash    VARCHAR(64),
+    page_title      TEXT,
+    http_status     SMALLINT,
+    dom_text_length INTEGER DEFAULT 0,
+    has_changed     BOOLEAN DEFAULT TRUE,
+    headers         JSONB DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_target ON snapshots(target_id, taken_at DESC);
+CREATE INDEX IF NOT EXISTS idx_snapshots_hash ON snapshots(target_id, content_hash);
+
 -- 兼容老数据库字段迁移
 ALTER TABLE group_settings ADD COLUMN IF NOT EXISTS rate_limit INTEGER DEFAULT 0;
+ALTER TABLE group_settings ADD COLUMN IF NOT EXISTS expect_dns_server TEXT;
+ALTER TABLE group_settings ADD COLUMN IF NOT EXISTS snapshot_interval INTEGER DEFAULT 21600;
+ALTER TABLE targets ADD COLUMN IF NOT EXISTS expect_dns_server TEXT;
+ALTER TABLE targets ADD COLUMN IF NOT EXISTS snapshot_interval INTEGER DEFAULT 21600;
+ALTER TABLE target_status ADD COLUMN IF NOT EXISTS dns_server TEXT;
+ALTER TABLE target_status ADD COLUMN IF NOT EXISTS last_snapshot_id BIGINT;
+ALTER TABLE target_status ADD COLUMN IF NOT EXISTS last_snapshot_at TIMESTAMPTZ;

@@ -14,6 +14,10 @@
               <el-input-number v-model="globalForm.screenshot_interval" :min="600" :step="600" />
               <span style="margin-left: 8px; color: #999">秒 ({{ formatInterval(globalForm.screenshot_interval) }})</span>
             </el-form-item>
+            <el-form-item label="快照间隔">
+              <el-input-number v-model="globalForm.snapshot_interval" :min="600" :step="600" />
+              <span style="margin-left: 8px; color: #999">秒 ({{ formatInterval(globalForm.snapshot_interval) }})</span>
+            </el-form-item>
             <el-form-item label="最大检测并发">
               <el-input-number v-model="globalForm.max_concurrent_checks" :min="10" :max="1000" :step="50" />
             </el-form-item>
@@ -188,20 +192,36 @@
                 </el-select>
               </template>
             </el-table-column>
+            <el-table-column label="预期DNS" width="130">
+              <template #default="{ row }">
+                <el-input v-model="row.expect_dns_server" size="small" placeholder="如 cloudflare" clearable @change="onGroupChange(row)" />
+              </template>
+            </el-table-column>
             <el-table-column label="启用" width="70" align="center">
               <template #default="{ row }">
                 <el-switch v-model="row.enabled" size="small" @change="onGroupChange(row)" />
               </template>
             </el-table-column>
-            <el-table-column label="备注" width="160">
+            <el-table-column label="备注" width="150">
               <template #default="{ row }">
                 <el-input v-model="row.note" size="small" placeholder="备注" @change="onGroupChange(row)" />
               </template>
             </el-table-column>
-            <el-table-column label="操作" width="70" align="center">
+            <el-table-column label="操作" width="130" align="center">
               <template #default="{ row }">
                 <el-button v-if="row._dirty" link type="primary" size="small" @click="saveGroup(row)">保存</el-button>
-                <el-tag v-else type="success" size="small">✓</el-tag>
+                <span v-else style="color: #67c23a; margin-right: 6px; font-size: 12px">✓</span>
+                <el-popconfirm
+                  :title="`确定彻底删除分组 [${row.group_name}] 及其关联的 ${row.total_targets} 个站点和全部历史数据？`"
+                  confirm-button-text="删除"
+                  cancel-button-text="取消"
+                  confirm-button-type="danger"
+                  @confirm="deleteGroup(row.group_name)"
+                >
+                  <template #reference>
+                    <el-button link type="danger" size="small">删除</el-button>
+                  </template>
+                </el-popconfirm>
               </template>
             </el-table-column>
           </el-table>
@@ -267,6 +287,7 @@ const uaPresets = {
 const globalForm = ref({
   check_interval: 300,
   screenshot_interval: 21600,
+  snapshot_interval: 21600,
   max_concurrent_checks: 200,
   playwright_concurrency: 8,
   consecutive_fails_threshold: 3,
@@ -348,15 +369,27 @@ async function saveGroup(row) {
   try {
     await api.updateGroupSetting(row.group_name, {
       max_concurrency: row.max_concurrency,
+      rate_limit: row.rate_limit,
       request_timeout: row.request_timeout,
       user_agent: row.user_agent || null,
+      expect_dns_server: row.expect_dns_server || null,
       enabled: row.enabled,
       note: row.note || null,
     })
     row._dirty = false
     ElMessage.success(`分组 [${row.group_name}] 设置已保存`)
   } catch (e) {
-    ElMessage.error('保存失败')
+    ElMessage.error('保存失败: ' + (e.response?.data?.detail || e.message))
+  }
+}
+
+async function deleteGroup(groupName) {
+  try {
+    const { data } = await api.deleteGroup(groupName)
+    ElMessage.success(data.message || `分组 [${groupName}] 已从数据库彻底清理`)
+    await loadGroupSettings()
+  } catch (e) {
+    ElMessage.error('删除分组失败: ' + (e.response?.data?.detail || e.message))
   }
 }
 

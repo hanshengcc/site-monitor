@@ -14,7 +14,7 @@ from backend.app.config import settings
 from backend.app.database import AsyncSessionLocal
 from backend.app.models import GlobalSetting
 from backend.app.scheduler import start_scheduler, stop_scheduler
-from backend.app.routers import targets, results, screenshots, alerts, dashboard, tasks, settings as settings_router, system
+from backend.app.routers import targets, results, screenshots, snapshots, alerts, dashboard, tasks, settings as settings_router, system
 
 
 async def load_settings_from_db():
@@ -30,6 +30,9 @@ async def load_settings_from_db():
                 elif r.key == "screenshot_interval":
                     val_int = int(val) if str(val).isdigit() else 21600
                     settings.screenshot_interval_minutes = max(1, val_int // 60) if val_int >= 60 else 1
+                elif r.key == "snapshot_interval":
+                    val_int = int(val) if str(val).isdigit() else 21600
+                    settings.snapshot_interval_minutes = max(1, val_int // 60) if val_int >= 60 else 1
                 elif r.key == "max_concurrent_checks":
                     settings.max_concurrent_checks = int(val)
                 elif r.key == "playwright_concurrency":
@@ -71,6 +74,32 @@ async def init_db_schema():
                 )
             """))
             await session.execute(text("ALTER TABLE group_settings ADD COLUMN IF NOT EXISTS rate_limit INTEGER DEFAULT 0"))
+            await session.execute(text("ALTER TABLE targets ADD COLUMN IF NOT EXISTS expect_dns_server TEXT"))
+            await session.execute(text("ALTER TABLE targets ADD COLUMN IF NOT EXISTS snapshot_interval INTEGER DEFAULT 21600"))
+            await session.execute(text("ALTER TABLE group_settings ADD COLUMN IF NOT EXISTS expect_dns_server TEXT"))
+            await session.execute(text("ALTER TABLE group_settings ADD COLUMN IF NOT EXISTS snapshot_interval INTEGER DEFAULT 21600"))
+            await session.execute(text("ALTER TABLE target_status ADD COLUMN IF NOT EXISTS dns_server TEXT"))
+            await session.execute(text("CREATE INDEX IF NOT EXISTS idx_target_status_dns_server ON target_status(dns_server)"))
+            await session.execute(text("""
+                CREATE TABLE IF NOT EXISTS snapshots (
+                    id BIGSERIAL PRIMARY KEY,
+                    target_id INTEGER NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
+                    taken_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    file_path TEXT NOT NULL,
+                    file_size INTEGER,
+                    compressed_size INTEGER,
+                    content_hash VARCHAR(64),
+                    page_title TEXT,
+                    http_status SMALLINT,
+                    dom_text_length INTEGER DEFAULT 0,
+                    has_changed BOOLEAN DEFAULT TRUE,
+                    headers JSONB DEFAULT '{}'
+                )
+            """))
+            await session.execute(text("CREATE INDEX IF NOT EXISTS idx_snapshots_target ON snapshots(target_id, taken_at DESC)"))
+            await session.execute(text("CREATE INDEX IF NOT EXISTS idx_snapshots_hash ON snapshots(target_id, content_hash)"))
+            await session.execute(text("ALTER TABLE target_status ADD COLUMN IF NOT EXISTS last_snapshot_id BIGINT"))
+            await session.execute(text("ALTER TABLE target_status ADD COLUMN IF NOT EXISTS last_snapshot_at TIMESTAMPTZ"))
             await session.commit()
             logger.info("Database schema auto-check completed.")
     except Exception as e:
@@ -82,8 +111,9 @@ async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
     logger.info("Starting Site Monitor...")
 
-    # Ensure screenshots dir exists
+    # Ensure screenshots and snapshots dirs exist
     Path(settings.screenshots_dir).mkdir(parents=True, exist_ok=True)
+    Path(settings.snapshots_dir).mkdir(parents=True, exist_ok=True)
 
     # Auto-migrate/verify database schema
     await init_db_schema()
@@ -136,6 +166,7 @@ async def localhost_only_middleware(request: Request, call_next):
 app.include_router(targets.router)
 app.include_router(results.router)
 app.include_router(screenshots.router)
+app.include_router(snapshots.router)
 app.include_router(alerts.router)
 app.include_router(dashboard.router)
 app.include_router(tasks.router)

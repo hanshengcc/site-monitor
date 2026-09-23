@@ -9,7 +9,7 @@ from sqlalchemy import select, func, or_, and_, not_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.database import get_db, AsyncSessionLocal
-from backend.app.models import Target, TargetStatus, Anomaly, Screenshot
+from backend.app.models import Target, TargetStatus, Anomaly, Screenshot, Snapshot
 from backend.app.schemas import DashboardStats
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
@@ -39,6 +39,9 @@ async def get_dashboard_stats(db: AsyncSession = Depends(get_db)):
     shots_today = (await db.execute(
         select(func.count(Screenshot.id)).where(Screenshot.taken_at >= today)
     )).scalar() or 0
+    snaps_today = (await db.execute(
+        select(func.count(Snapshot.id)).where(Snapshot.taken_at >= today)
+    )).scalar() or 0
 
     return DashboardStats(
         total_targets=total,
@@ -48,6 +51,7 @@ async def get_dashboard_stats(db: AsyncSession = Depends(get_db)):
         unknown=max(0, unknown),
         open_anomalies=open_anomalies,
         screenshots_today=shots_today,
+        snapshots_today=snaps_today,
     )
 
 
@@ -121,8 +125,8 @@ async def group_stats(db: AsyncSession = Depends(get_db)):
 # Error category helpers shared by recent-failures & export
 # ---------------------------------------------------------------------------
 _DOMAIN_EXPIRED_PATTERNS = [
-    "域名过期/注册商处",
-    "domain_expired", "domain_parked", "domain_not_found", "registrar_held",
+    "域名已过期或停放", "域名过期", "域名停放", "域名过期/注册商处",
+    "domain_expired", "domain_parked", "domain_not_found", "registrar_held", "dns服务器不匹配",
 ]
 
 

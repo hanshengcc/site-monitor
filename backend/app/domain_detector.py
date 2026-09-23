@@ -1,21 +1,19 @@
-"""Domain status detector - multi-signal detection for expired/parked domains.
+"""Domain status detector - pure DNS-based detection for expired/parked domains.
 
-Detection signals (from most to least reliable):
-  1. DNS NXDOMAIN          → domain doesn't exist (deleted/expired)
-  2. NS record matching    → known registrar parking nameservers
-  3. CNAME pointing to     → known parking/redirect services
-  4. A record IP matching  → known parking IP ranges
-  5. WHOIS expiration date → domain actually expired (optional, port 43 often blocked)
-  6. HTTP response content → keyword matching in page body (least reliable, as fallback)
+Detection signals:
+  1. DNS NXDOMAIN          → domain doesn't exist (deleted/expired/unregistered)
+  2. NS record matching    → authoritative nameserver is a known parking/expired DNS server
+  3. CNAME pointing to     → CNAME record points to known parking/redirect services
+  4. A record IP matching  → A record resolves to known parking IP ranges
+  5. DNS server mismatch   → domain's DNS server does not match expected DNS server
 
-Each signal produces evidence with a confidence score. Final verdict is based on
-weighted combination of all signals.
+NO string/keyword matching on HTML page content is performed.
+All determinations are strictly based on the domain's authoritative DNS servers and records.
 """
 import asyncio
 import ipaddress
-import re
+import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -25,41 +23,41 @@ from loguru import logger
 
 
 # ============================================================
-# Signal 1: Known parking / registrar NS patterns
+# Signal 1: Known parking / registrar expired NS patterns
 # ============================================================
-# These are nameserver hostnames used by registrars for parked/expired domains.
-# Compiled from real-world observations. Each entry is a substring match.
+# Authoritative nameservers used by registrars when a domain is parked or expired.
 PARKING_NS_PATTERNS = [
     # Generic parking
     "parking", "parked", "sedoparking", "parkingcrew",
     "above.com", "bodis.com", "undeveloped.com",
-    # Expiry-specific NS (e.g. Gname, GoDaddy)
+    "dan.com", "afternic",
+    "hugedomains", "domainlore", "parked.com",
+    # Expiry-specific NS
     "expire", "expired",
-    "gname-dns.com",        # Gname expired NS (jdz2che.com case)
-    "domaincontrol.com",    # GoDaddy (sometimes parking)
-    # Chinese registrars parking
-    "parkdns", "parkinglot", "dnspod-free",
-    "nodns.dnspod.net",     # DNSPod placeholder when expired
-    "f1g1ns1.dnspod.net",   # Free tier / parked
-    "parking.xinnet.com",   # 新网 parking
-    "ns.hostmonster.com",   # HostMonster default
-    "ns.bluehost.com",      # Bluehost default
-    # Afternic / Dan.com
-    "afternic", "dan.com",
-    # NameSilo / Namesilo parking
+    # Gname expired / parking NS (e.g. jdz2che.com case)
+    "gname-dns.com", "exp.gname.net",
+    # DNSPod expired / held / parking
+    "nodns.dnspod.net", "f1g1ns1.dnspod.net", "parkdns", "parkinglot", "dnspod-free",
+    # 新网 parking
+    "parking.xinnet.com", "xinnetdns.com/parking",
+    # 阿里 / 万网 parking
+    "parking.aliyun.com", "park.hichina.com", "dns.hichina.com/parking",
+    # 西部数码 parking
+    "parking.west.cn", "west263.com/parking", "west-dnsxx",
+    # NameSilo parking
     "dnsv.jp", "domaindefend",
-    # Sav.com
+    # Sav.com parking
     "sav.com",
-    # HugeDomains
-    "hugedomains",
-    # Porkbun
-    "porkbun.com/parking",
-    # West263 / 西部数码
-    "west263.com/parking", "west-dnsxx",
-    # Dynadot
-    "dynadot.com",
-    # NameBright
-    "namebright",
+    # Porkbun parking
+    "porkbun.com/parking", "parking.porkbun.com",
+    # Dynadot parking
+    "parking.dynadot.com",
+    # NameBright parking
+    "parking.namebright.com",
+    # GoDaddy parking
+    "parked.domaincontrol.com",
+    # HostMonster / Bluehost parking
+    "parking.hostmonster.com", "parking.bluehost.com",
     # PUSHDO
     "push.dns",
 ]
@@ -68,7 +66,7 @@ PARKING_NS_PATTERNS = [
 # Signal 2: Known parking CNAME targets
 # ============================================================
 PARKING_CNAME_PATTERNS = [
-    "exp.gname.net",        # Gname expired redirect
+    "exp.gname.net",
     "parking.above.com",
     "sedoparking.com",
     "bodis.com",
@@ -86,13 +84,12 @@ PARKING_CNAME_PATTERNS = [
     "expired.hostmonster.com",
     "sedo.com",
     "dsredirection",
-    "gname.net",            # Gname generic
+    "gname.net",
 ]
 
 # ============================================================
 # Signal 3: Known parking IP ranges (CIDR blocks)
 # ============================================================
-# Some registrars/parking services use fixed IP ranges.
 PARKING_IP_RANGES = [
     # Sedo
     "208.91.196.0/23", "208.91.198.0/24",
@@ -106,12 +103,12 @@ PARKING_IP_RANGES = [
     "184.168.131.0/24", "34.102.136.180/32",
     # Afternic
     "97.74.104.0/24",
-    # 常见注册商停放页 IP (Chinese)
-    "43.242.166.0/24",      # 西部数码停放
-    "103.224.182.0/24",     # 部分国内停放
+    # 西部数码停放
+    "43.242.166.0/24",
+    # 国内常见停放
+    "103.224.182.0/24",
 ]
 
-# Pre-parse into ipaddress networks for fast lookup
 _PARKING_NETWORKS = []
 for cidr in PARKING_IP_RANGES:
     try:
@@ -119,152 +116,155 @@ for cidr in PARKING_IP_RANGES:
     except ValueError:
         pass
 
-# ============================================================
-# Signal 4: HTTP response content keywords (kept as fallback)
-# ============================================================
-EXPIRED_PAGE_KEYWORDS = [
-    # English - high confidence
-    "domain has expired", "this domain has expired", "domain name has expired",
-    "domain is expired", "this domain is for sale", "buy this domain",
-    "this domain may be for sale", "domain parking", "this domain is parked",
-    "parked free", "parked by", "sedoparking",
-    "hugedomains", "afternic", "sav.com",
-    "renew your domain", "domain renewal",
-    "this site is no longer available",
-    "this account has been suspended", "account suspended",
-    "hosting has expired", "website expired",
-    # English - medium confidence (more generic)
-    "domain for sale", "expired domain",
-    # Chinese - high confidence
-    "域名过期", "域名已过期", "域名到期",
-    "域名出售", "域名转让", "此域名可出售",
-    "域名停放", "该域名已过期",
-    "域名未续费", "域名续费",
-    "域名已暂停", "网站已到期",
-    "虚拟主机已到期", "主机已过期", "空间已到期",
-    "请联系域名注册商",
-    # Chinese - medium confidence
-    "万网", "新网", "西部数码",
-]
+
+COMMON_TWO_PART_TLDS = {
+    "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn", "mil.cn", "ac.cn",
+    "co.uk", "org.uk", "me.uk", "ltd.uk", "plc.uk",
+    "co.jp", "ne.jp", "or.jp", "ac.jp", "ad.jp", "ed.jp", "go.jp",
+    "com.hk", "org.hk", "net.hk", "edu.hk", "gov.hk",
+    "com.tw", "org.tw", "net.tw", "edu.tw", "gov.tw",
+    "co.kr", "ne.kr", "or.kr", "re.kr",
+    "com.au", "net.au", "org.au", "edu.au",
+    "co.nz", "net.nz", "org.nz",
+    "com.sg", "net.sg", "org.sg",
+    "com.my", "net.my", "org.my",
+}
+
+
+def get_apex_domain(domain: str) -> str:
+    """Extract root/apex domain from full domain or subdomain.
+    Examples:
+        www.example.com -> example.com
+        sub.shop.example.com -> example.com
+        www.example.com.cn -> example.com.cn
+        example.com -> example.com
+        192.168.1.1 -> 192.168.1.1
+    """
+    domain = domain.lower().strip(".")
+    try:
+        ipaddress.ip_address(domain)
+        return domain
+    except ValueError:
+        pass
+
+    parts = domain.split(".")
+    if len(parts) <= 2:
+        return ".".join(parts)
+    two_part = ".".join(parts[-2:])
+    if two_part in COMMON_TWO_PART_TLDS:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
+def _extract_domain(url: str) -> str:
+    """Extract hostname without port from URL."""
+    if not url.startswith("http://") and not url.startswith("https://"):
+        url = "https://" + url
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    return host.split(":")[0].lower()
 
 
 @dataclass
 class DomainSignal:
-    """A single detection signal."""
-    signal_type: str        # dns_nxdomain, ns_parking, cname_parking, ip_parking, whois_expired, content_keyword
+    signal_type: str        # dns_nxdomain, ns_parking, cname_parking, ip_parking, dns_mismatch, dns_error
     confidence: float       # 0.0 ~ 1.0
-    detail: str             # Human-readable detail
+    detail: str             # Human-readable explanation
 
 
 @dataclass
 class DomainVerdict:
-    """Final domain status verdict."""
-    is_parked_or_expired: bool   # True only for NS/CNAME/IP parking signals
-    is_dns_not_found: bool = False  # True only for NXDOMAIN (separate from parked)
-    confidence: float = 0.0      # 0.0 ~ 1.0
-    category: str = "normal"     # normal, domain_expired, domain_parked, domain_not_found, registrar_held
-    summary: str = ""            # One-line Chinese summary for display
+    is_parked_or_expired: bool
+    is_dns_not_found: bool = False
+    is_dns_error: bool = False
+    confidence: float = 0.0
+    category: str = "normal"  # normal, domain_expired, domain_parked, domain_not_found, dns_mismatch, dns_error
+    summary: str = ""
+    dns_server: Optional[str] = None  # Comma-separated nameservers (e.g. "ns1.alidns.com, ns2.alidns.com")
+    ns_records: list[str] = field(default_factory=list)
     signals: list[DomainSignal] = field(default_factory=list)
 
 
-def _extract_domain(url: str) -> str:
-    """Extract bare domain from URL."""
-    if not url.startswith("http"):
-        url = "https://" + url
-    parsed = urlparse(url)
-    host = parsed.hostname or ""
-    # Remove port if present
-    host = host.split(":")[0]
-    return host.lower()
+# In-memory TTL cache for DNS query results (300 seconds TTL)
+_DNS_CACHE: dict[str, tuple[float, dict]] = {}
+_DNS_CACHE_TTL = 300.0
 
 
-def _sync_resolve_ns(domain: str, timeout: float = 5.0) -> list[str]:
-    """Synchronous NS resolution. Handles CNAME + NS edge cases better than async."""
-    sync_resolver = dns.resolver.Resolver()
-    sync_resolver.lifetime = timeout
-    sync_resolver.timeout = timeout
-    try:
-        answers = sync_resolver.resolve(domain, "NS")
-        return [str(r.target).rstrip(".").lower() for r in answers]
-    except dns.resolver.NoAnswer:
-        # Try parent zone
-        parts = domain.split(".")
-        if len(parts) > 2:
-            parent = ".".join(parts[-2:])
-            answers = sync_resolver.resolve(parent, "NS")
-            return [str(r.target).rstrip(".").lower() for r in answers]
-    return []
+async def _resolve_dns(domain: str, timeout: float = 3.0) -> dict:
+    """Resolve DNS records for domain with in-memory caching and apex NS fallback."""
+    now = time.monotonic()
+    if domain in _DNS_CACHE:
+        ts, cached = _DNS_CACHE[domain]
+        if now - ts < _DNS_CACHE_TTL:
+            return cached
 
-
-async def _resolve_dns(domain: str, timeout: float = 5.0) -> dict:
-    """Resolve DNS records for a domain. Returns dict with A, NS, CNAME info."""
+    apex = get_apex_domain(domain)
     resolver = dns.asyncresolver.Resolver()
     resolver.lifetime = timeout
     resolver.timeout = timeout
 
     result = {
+        "domain": domain,
+        "apex": apex,
         "a_records": [],
         "ns_records": [],
         "cname_records": [],
         "nxdomain": False,
-        "no_answer": False,
+        "no_nameservers": False,
         "error": None,
     }
 
-    # --- A records ---
-    try:
-        answers = await resolver.resolve(domain, "A")
-        result["a_records"] = [r.address for r in answers]
-    except dns.resolver.NXDOMAIN:
-        result["nxdomain"] = True
-        return result  # No point checking NS/CNAME if domain doesn't exist
-    except dns.resolver.NoAnswer:
-        result["no_answer"] = True
-    except dns.resolver.NoNameservers:
-        result["error"] = "no_nameservers"
-    except Exception as e:
-        result["error"] = f"a_error: {str(e)[:100]}"
-
-    # --- NS records ---
-    # NS records are typically on the zone apex. The async resolver can sometimes
-    # return NoAnswer when the domain has a CNAME. Fall back to sync resolver in
-    # a thread executor for reliability.
-    try:
-        answers = await resolver.resolve(domain, "NS")
-        result["ns_records"] = [str(r.target).rstrip(".").lower() for r in answers]
-    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
-        # Async resolver failed — try sync resolver in thread (handles CNAME + NS better)
+    # 1. Query NS records
+    # Authoritative NS records live at the zone apex. If querying subdomain returns
+    # NoAnswer, fall back to apex.
+    targets_for_ns = [apex] if apex == domain else [apex, domain]
+    for d in targets_for_ns:
         try:
-            loop = asyncio.get_event_loop()
-            ns_list = await loop.run_in_executor(None, _sync_resolve_ns, domain, timeout)
-            result["ns_records"] = ns_list
+            answers = await resolver.resolve(d, "NS")
+            result["ns_records"] = [str(r.target).rstrip(".").lower() for r in answers]
+            if result["ns_records"]:
+                break
+        except dns.resolver.NXDOMAIN:
+            result["nxdomain"] = True
+            break
+        except (dns.resolver.NoAnswer, dns.resolver.NoNameservers):
+            continue
+        except Exception as e:
+            result["error"] = str(e)
+            break
+
+    # 2. If not already NXDOMAIN, query A and CNAME records
+    if not result["nxdomain"]:
+        try:
+            answers = await resolver.resolve(domain, "A")
+            result["a_records"] = [r.address for r in answers]
+        except dns.resolver.NXDOMAIN:
+            result["nxdomain"] = True
+        except (dns.resolver.NoAnswer, dns.resolver.NoNameservers):
+            pass
         except Exception:
             pass
-    except Exception:
-        pass
 
-    # --- CNAME (query directly, may raise NoAnswer if A record exists) ---
-    try:
-        answers = await resolver.resolve(domain, "CNAME")
-        result["cname_records"] = [str(r.target).rstrip(".").lower() for r in answers]
-    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
-        pass
-    except Exception:
-        pass
+        try:
+            answers = await resolver.resolve(domain, "CNAME")
+            result["cname_records"] = [str(r.target).rstrip(".").lower() for r in answers]
+        except Exception:
+            pass
 
+    _DNS_CACHE[domain] = (now, result)
     return result
 
 
 def _check_ns_signals(ns_records: list[str]) -> Optional[DomainSignal]:
-    """Check if NS records match known parking nameservers."""
+    """Check if any authoritative nameserver matches known parking/expired patterns."""
     for ns in ns_records:
         ns_lower = ns.lower()
         for pattern in PARKING_NS_PATTERNS:
             if pattern in ns_lower:
                 return DomainSignal(
                     signal_type="ns_parking",
-                    confidence=0.90,
-                    detail=f"NS '{ns}' 匹配停放模式 '{pattern}'",
+                    confidence=0.95,
+                    detail=f"DNS服务器 '{ns}' 匹配停放/过期模式 '{pattern}'",
                 )
     return None
 
@@ -292,7 +292,7 @@ def _check_ip_signals(a_records: list[str]) -> Optional[DomainSignal]:
                 if ip in network:
                     return DomainSignal(
                         signal_type="ip_parking",
-                        confidence=0.80,
+                        confidence=0.85,
                         detail=f"IP {ip_str} 在已知停放段 {network}",
                     )
         except ValueError:
@@ -300,36 +300,22 @@ def _check_ip_signals(a_records: list[str]) -> Optional[DomainSignal]:
     return None
 
 
-def check_content_signals(body_text: str) -> Optional[DomainSignal]:
-    """Check HTTP response body for parking/expired keywords."""
-    if not body_text:
-        return None
-    text_lower = body_text.lower()[:50000]
-    for kw in EXPIRED_PAGE_KEYWORDS:
-        if kw.lower() in text_lower:
-            return DomainSignal(
-                signal_type="content_keyword",
-                confidence=0.60,
-                detail=f"页面内容匹配: '{kw}'",
-            )
-    return None
-
-
 async def detect_domain_status(
     url: str,
-    response_body: Optional[str] = None,
-    dns_timeout: float = 5.0,
+    expect_dns_server: Optional[str] = None,
+    dns_timeout: float = 3.0,
 ) -> DomainVerdict:
-    """
-    Multi-signal domain status detection.
+    """Judge domain status purely based on authoritative DNS servers and records.
 
-    Call flow:
-      1. Extract domain from URL
-      2. DNS resolve (A, NS, CNAME)
-      3. Check each signal
-      4. Combine signals into final verdict
+    Detection flow:
+      1. Extract domain and resolve authoritative NS, A, CNAME records.
+      2. If NXDOMAIN → domain expired/not found.
+      3. If NS matches parking/expired patterns → domain expired/parked.
+      4. If expect_dns_server is set and not matched → DNS server mismatch.
+      5. If CNAME or IP matches parking ranges → domain parked.
+      6. Otherwise → normal domain status.
 
-    Returns DomainVerdict with category and confidence.
+    NO response content string matching is performed.
     """
     domain = _extract_domain(url)
     if not domain:
@@ -338,146 +324,162 @@ async def detect_domain_status(
             confidence=0.0,
             category="normal",
             summary="",
+            dns_server=None,
+            ns_records=[],
             signals=[],
         )
 
-    signals: list[DomainSignal] = []
-
-    # --- DNS resolution ---
     try:
         dns_info = await _resolve_dns(domain, timeout=dns_timeout)
     except Exception as e:
         logger.debug(f"DNS resolution failed for {domain}: {e}")
-        dns_info = {"a_records": [], "ns_records": [], "cname_records": [],
-                     "nxdomain": False, "no_answer": False, "error": str(e)}
+        dns_info = {
+            "domain": domain, "apex": domain,
+            "a_records": [], "ns_records": [], "cname_records": [],
+            "nxdomain": False, "no_nameservers": False, "error": str(e),
+        }
 
-    # Signal: NXDOMAIN
-    if dns_info["nxdomain"]:
+    ns_records = dns_info.get("ns_records", [])
+    dns_server_str = ", ".join(ns_records) if ns_records else None
+    signals: list[DomainSignal] = []
+
+    # 1. Check NXDOMAIN (domain deleted or expired from registry)
+    if dns_info.get("nxdomain"):
         signals.append(DomainSignal(
             signal_type="dns_nxdomain",
             confidence=0.99,
             detail=f"域名 {domain} DNS 不存在 (NXDOMAIN)",
         ))
-
-    # Signal: NS parking
-    if dns_info["ns_records"]:
-        ns_signal = _check_ns_signals(dns_info["ns_records"])
-        if ns_signal:
-            signals.append(ns_signal)
-
-    # Signal: CNAME parking
-    if dns_info["cname_records"]:
-        cname_signal = _check_cname_signals(dns_info["cname_records"])
-        if cname_signal:
-            signals.append(cname_signal)
-
-    # Signal: IP parking
-    if dns_info["a_records"]:
-        ip_signal = _check_ip_signals(dns_info["a_records"])
-        if ip_signal:
-            signals.append(ip_signal)
-
-    # Signal: Content keywords (lowest priority)
-    if response_body:
-        content_signal = check_content_signals(response_body)
-        if content_signal:
-            signals.append(content_signal)
-
-    # --- Combine signals into verdict ---
-    if not signals:
-        return DomainVerdict(
-            is_parked_or_expired=False,
-            confidence=0.0,
-            category="normal",
-            summary="",
-            signals=[],
-        )
-
-    # Highest confidence signal drives the decision
-    max_confidence = max(s.confidence for s in signals)
-    # Multiple signals boost confidence
-    combined = min(1.0, max_confidence + 0.05 * (len(signals) - 1))
-
-    # Determine category
-    signal_types = {s.signal_type for s in signals}
-
-    if "dns_nxdomain" in signal_types:
-        # NXDOMAIN = domain simply doesn't resolve.
-        # This is NOT the same as parked/expired. Separate category.
         return DomainVerdict(
             is_parked_or_expired=False,
             is_dns_not_found=True,
-            confidence=combined,
+            confidence=0.99,
             category="domain_not_found",
-            summary=f"DNS无法解析 (NXDOMAIN)",
+            summary="DNS无法解析 (域名不存在/NXDOMAIN)",
+            dns_server=None,
+            ns_records=[],
             signals=signals,
         )
-    elif "ns_parking" in signal_types and ("cname_parking" in signal_types or "ip_parking" in signal_types):
-        category = "domain_expired"
-        summary = "域名过期/注册商停放"
-    elif "ns_parking" in signal_types:
-        category = "domain_expired"
-        ns_detail = next(s.detail for s in signals if s.signal_type == "ns_parking")
-        summary = f"域名过期/注册商处 ({ns_detail})"
-    elif "cname_parking" in signal_types:
-        category = "domain_parked"
-        summary = "域名停放 (CNAME指向停放服务)"
-    elif "ip_parking" in signal_types:
-        category = "domain_parked"
-        summary = "域名停放 (IP指向停放服务)"
-    elif "content_keyword" in signal_types:
-        # Content-only signal, lower confidence
-        if combined >= 0.6:
-            category = "registrar_held"
-            kw_detail = next(s.detail for s in signals if s.signal_type == "content_keyword")
-            summary = f"疑似域名过期/注册商处 ({kw_detail})"
-        else:
+
+    # 2. Check NS Parking / Expired nameserver
+    if ns_records:
+        ns_signal = _check_ns_signals(ns_records)
+        if ns_signal:
+            signals.append(ns_signal)
             return DomainVerdict(
-                is_parked_or_expired=False, confidence=combined,
-                category="normal", summary="", signals=signals,
+                is_parked_or_expired=True,
+                confidence=0.95,
+                category="domain_expired",
+                summary=f"域名已过期或停放 ({ns_signal.detail})",
+                dns_server=dns_server_str,
+                ns_records=ns_records,
+                signals=signals,
             )
-    else:
-        category = "domain_parked"
-        summary = "疑似域名停放"
 
-    is_expired = combined >= 0.50
+    # 3. Check Expected DNS Server matching (if configured)
+    if expect_dns_server and ns_records:
+        expected_lower = expect_dns_server.strip().lower()
+        if not any(expected_lower in ns for ns in ns_records):
+            mismatch_signal = DomainSignal(
+                signal_type="dns_mismatch",
+                confidence=0.95,
+                detail=f"当前DNS服务器: {dns_server_str}，预期包含: {expect_dns_server}",
+            )
+            signals.append(mismatch_signal)
+            return DomainVerdict(
+                is_parked_or_expired=True,
+                confidence=0.95,
+                category="dns_mismatch",
+                summary=f"DNS服务器不匹配 (当前: {dns_server_str or '无'}, 预期包含: {expect_dns_server})",
+                dns_server=dns_server_str,
+                ns_records=ns_records,
+                signals=signals,
+            )
 
+    # 4. Check CNAME parking
+    if dns_info.get("cname_records"):
+        cname_signal = _check_cname_signals(dns_info["cname_records"])
+        if cname_signal:
+            signals.append(cname_signal)
+            return DomainVerdict(
+                is_parked_or_expired=True,
+                confidence=0.95,
+                category="domain_parked",
+                summary=f"域名解析指向停放服务 ({cname_signal.detail})",
+                dns_server=dns_server_str,
+                ns_records=ns_records,
+                signals=signals,
+            )
+
+    # 5. Check IP parking
+    if dns_info.get("a_records"):
+        ip_signal = _check_ip_signals(dns_info["a_records"])
+        if ip_signal:
+            signals.append(ip_signal)
+            return DomainVerdict(
+                is_parked_or_expired=True,
+                confidence=0.85,
+                category="domain_parked",
+                summary=f"域名解析指向停放IP ({ip_signal.detail})",
+                dns_server=dns_server_str,
+                ns_records=ns_records,
+                signals=signals,
+            )
+
+    # 6. Check if NoNameservers / resolution error
+    if dns_info.get("no_nameservers") or (not ns_records and dns_info.get("error")):
+        err_detail = dns_info.get("error") or "无可用DNS服务器"
+        signals.append(DomainSignal(
+            signal_type="dns_error",
+            confidence=0.80,
+            detail=f"DNS服务器异常: {err_detail}",
+        ))
+        return DomainVerdict(
+            is_parked_or_expired=False,
+            is_dns_error=True,
+            confidence=0.80,
+            category="dns_error",
+            summary=f"DNS解析失败 ({err_detail})",
+            dns_server=dns_server_str,
+            ns_records=ns_records,
+            signals=signals,
+        )
+
+    # 7. Normal DNS status
     return DomainVerdict(
-        is_parked_or_expired=is_expired,
-        confidence=round(combined, 2),
-        category=category,
-        summary=summary,
-        signals=signals,
+        is_parked_or_expired=False,
+        confidence=0.0,
+        category="normal",
+        summary="",
+        dns_server=dns_server_str,
+        ns_records=ns_records,
+        signals=[],
     )
 
 
-# ============================================================
-# Synchronous wrapper for use in non-async contexts
-# ============================================================
 def detect_domain_status_sync(
     url: str,
-    response_body: Optional[str] = None,
-    dns_timeout: float = 5.0,
+    expect_dns_server: Optional[str] = None,
+    dns_timeout: float = 3.0,
 ) -> DomainVerdict:
     """Sync wrapper around detect_domain_status."""
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
-            # Already in async context, create new loop in thread
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor() as pool:
                 future = pool.submit(
                     asyncio.run,
-                    detect_domain_status(url, response_body, dns_timeout),
+                    detect_domain_status(url, expect_dns_server, dns_timeout),
                 )
                 return future.result(timeout=dns_timeout + 2)
         else:
             return loop.run_until_complete(
-                detect_domain_status(url, response_body, dns_timeout)
+                detect_domain_status(url, expect_dns_server, dns_timeout)
             )
     except Exception as e:
         logger.debug(f"Sync domain detection failed: {e}")
         return DomainVerdict(
             is_parked_or_expired=False, confidence=0.0,
-            category="normal", summary="", signals=[],
+            category="normal", summary="", dns_server=None, ns_records=[], signals=[],
         )

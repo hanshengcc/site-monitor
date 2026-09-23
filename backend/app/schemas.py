@@ -12,8 +12,10 @@ class TargetCreate(BaseModel):
     tags: list[str] = []
     check_interval: int = 300
     shot_interval: int = 21600
+    snapshot_interval: int = 21600
     expect_status: int = 200
     expect_keyword: Optional[str] = None
+    expect_dns_server: Optional[str] = None
     protocol: str = "https"
     user_agent: Optional[str] = None
     request_timeout: int = 15
@@ -30,8 +32,10 @@ class TargetUpdate(BaseModel):
     tags: Optional[list[str]] = None
     check_interval: Optional[int] = None
     shot_interval: Optional[int] = None
+    snapshot_interval: Optional[int] = None
     expect_status: Optional[int] = None
     expect_keyword: Optional[str] = None
+    expect_dns_server: Optional[str] = None
     protocol: Optional[str] = None
     user_agent: Optional[str] = None
     request_timeout: Optional[int] = None
@@ -49,8 +53,11 @@ class TargetStatusOut(BaseModel):
     last_error: Optional[str] = None
     last_screenshot_id: Optional[int] = None
     last_screenshot_at: Optional[datetime] = None
+    last_snapshot_id: Optional[int] = None
+    last_snapshot_at: Optional[datetime] = None
     has_anomaly: bool = False
     consecutive_fails: int = 0
+    dns_server: Optional[str] = None
     # SSL certificate
     ssl_valid: Optional[bool] = None
     ssl_error: Optional[str] = None
@@ -73,8 +80,10 @@ class TargetOut(BaseModel):
     tags: list[str]
     check_interval: int
     shot_interval: int
+    snapshot_interval: int = 21600
     expect_status: int
     expect_keyword: Optional[str]
+    expect_dns_server: Optional[str] = None
     protocol: str = "https"
     user_agent: Optional[str] = None
     request_timeout: int = 15
@@ -95,6 +104,7 @@ class TargetBatchCreate(BaseModel):
     group: str = "default"
     check_interval: int = 300
     shot_interval: int = 21600
+    snapshot_interval: int = 21600
 
 
 # ---- Check Result ----
@@ -128,6 +138,25 @@ class ScreenshotOut(BaseModel):
     is_anomaly: bool = False
     anomaly_score: float = 0
     anomaly_reasons: list = []
+
+    class Config:
+        from_attributes = True
+
+
+# ---- Snapshot (网页时光机) ----
+class SnapshotOut(BaseModel):
+    id: int
+    target_id: int
+    taken_at: datetime
+    file_path: str
+    file_size: Optional[int] = None
+    compressed_size: Optional[int] = None
+    content_hash: Optional[str] = None
+    page_title: Optional[str] = None
+    http_status: Optional[int] = None
+    dom_text_length: int = 0
+    has_changed: bool = True
+    headers: dict = {}
 
     class Config:
         from_attributes = True
@@ -183,3 +212,4 @@ class DashboardStats(BaseModel):
     unknown: int = 0
     open_anomalies: int = 0
     screenshots_today: int = 0
+    snapshots_today: int = 0
