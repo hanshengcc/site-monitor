@@ -17,41 +17,47 @@ router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
 @router.get("/stats", response_model=DashboardStats)
 async def get_dashboard_stats(db: AsyncSession = Depends(get_db)):
-    total = (await db.execute(select(func.count(Target.id)))).scalar() or 0
-    enabled = (await db.execute(
-        select(func.count(Target.id)).where(Target.enabled == True)
-    )).scalar() or 0
+    """Dashboard headline counters.
 
-    healthy = (await db.execute(
-        select(func.count(TargetStatus.target_id)).where(TargetStatus.is_ok == True)
-    )).scalar() or 0
-    unhealthy = (await db.execute(
-        select(func.count(TargetStatus.target_id)).where(TargetStatus.is_ok == False)
-    )).scalar() or 0
-
-    unknown = enabled - healthy - unhealthy
-
-    open_anomalies = (await db.execute(
-        select(func.count(Anomaly.id)).where(Anomaly.state == "open")
-    )).scalar() or 0
-
+    Collected in two round trips rather than seven: the target counters share one
+    scan over targets/target_status, and the remaining three are independent
+    scalar subqueries evaluated together.
+    """
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    shots_today = (await db.execute(
-        select(func.count(Screenshot.id)).where(Screenshot.taken_at >= today)
-    )).scalar() or 0
-    snaps_today = (await db.execute(
-        select(func.count(Snapshot.id)).where(Snapshot.taken_at >= today)
-    )).scalar() or 0
+
+    target_counts = (await db.execute(
+        select(
+            func.count(Target.id).label("total"),
+            func.count(Target.id).filter(Target.enabled == True).label("enabled"),
+            func.count(TargetStatus.target_id).filter(TargetStatus.is_ok == True).label("healthy"),
+            func.count(TargetStatus.target_id).filter(TargetStatus.is_ok == False).label("unhealthy"),
+        ).outerjoin(TargetStatus, Target.id == TargetStatus.target_id)
+    )).one()
+
+    activity = (await db.execute(
+        select(
+            select(func.count(Anomaly.id)).where(Anomaly.state == "open")
+            .scalar_subquery().label("open_anomalies"),
+            select(func.count(Screenshot.id)).where(Screenshot.taken_at >= today)
+            .scalar_subquery().label("shots_today"),
+            select(func.count(Snapshot.id)).where(Snapshot.taken_at >= today)
+            .scalar_subquery().label("snaps_today"),
+        )
+    )).one()
+
+    enabled = target_counts.enabled or 0
+    healthy = target_counts.healthy or 0
+    unhealthy = target_counts.unhealthy or 0
 
     return DashboardStats(
-        total_targets=total,
+        total_targets=target_counts.total or 0,
         enabled_targets=enabled,
         healthy=healthy,
         unhealthy=unhealthy,
-        unknown=max(0, unknown),
-        open_anomalies=open_anomalies,
-        screenshots_today=shots_today,
-        snapshots_today=snaps_today,
+        unknown=max(0, enabled - healthy - unhealthy),
+        open_anomalies=activity.open_anomalies or 0,
+        screenshots_today=activity.shots_today or 0,
+        snapshots_today=activity.snaps_today or 0,
     )
 
 

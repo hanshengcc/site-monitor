@@ -18,9 +18,11 @@ async def get_check_results(
     size: int = Query(50, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
 ):
-    base = select(CheckResult).where(CheckResult.target_id == target_id)
-    total = (await db.execute(select(func.count()).select_from(base.subquery()))).scalar()
+    total = (await db.execute(
+        select(func.count()).select_from(CheckResult).where(CheckResult.target_id == target_id)
+    )).scalar()
 
+    base = select(CheckResult).where(CheckResult.target_id == target_id)
     stmt = base.order_by(CheckResult.checked_at.desc()).offset((page - 1) * size).limit(size)
     rows = await db.execute(stmt)
     items = [CheckResultOut.model_validate(r) for r in rows.scalars().all()]
@@ -46,19 +48,21 @@ async def get_stats(target_id: int, hours: int = Query(24, ge=1, le=720), db: As
     from datetime import datetime, timedelta, timezone
     since = datetime.now(timezone.utc) - timedelta(hours=hours)
 
-    total_stmt = select(func.count()).where(
-        CheckResult.target_id == target_id, CheckResult.checked_at >= since
-    )
-    ok_stmt = select(func.count()).where(
-        CheckResult.target_id == target_id, CheckResult.checked_at >= since, CheckResult.is_ok == True
-    )
-    avg_latency_stmt = select(func.avg(CheckResult.latency_ms)).where(
-        CheckResult.target_id == target_id, CheckResult.checked_at >= since, CheckResult.latency_ms.isnot(None)
-    )
+    # One scan over the window instead of three: the partitioned check_results
+    # table is expensive to walk, so total/ok/avg are aggregated together.
+    row = (await db.execute(
+        select(
+            func.count().label("total"),
+            func.count().filter(CheckResult.is_ok == True).label("ok"),
+            func.avg(CheckResult.latency_ms).label("avg_latency"),
+        )
+        .select_from(CheckResult)
+        .where(CheckResult.target_id == target_id, CheckResult.checked_at >= since)
+    )).one()
 
-    total = (await db.execute(total_stmt)).scalar() or 0
-    ok = (await db.execute(ok_stmt)).scalar() or 0
-    avg_latency = (await db.execute(avg_latency_stmt)).scalar()
+    total = row.total or 0
+    ok = row.ok or 0
+    avg_latency = row.avg_latency
 
     return {
         "hours": hours,

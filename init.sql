@@ -128,6 +128,10 @@ CREATE TABLE IF NOT EXISTS anomalies (
 CREATE INDEX idx_anomalies_target ON anomalies(target_id, detected_at DESC);
 CREATE INDEX idx_anomalies_state ON anomalies(state) WHERE state = 'open';
 CREATE INDEX IF NOT EXISTS idx_anomalies_screenshot_id ON anomalies(screenshot_id);
+-- Every check round resolves/opens anomalies per target; keep that lookup
+-- proportional to the open set rather than to all anomaly history.
+CREATE INDEX IF NOT EXISTS idx_anomalies_open_by_target
+    ON anomalies(target_id, anomaly_type) WHERE state = 'open';
 
 -- 告警渠道
 CREATE TABLE IF NOT EXISTS alert_channels (
@@ -169,6 +173,11 @@ CREATE INDEX IF NOT EXISTS idx_target_status_ssl_valid ON target_status(ssl_vali
 CREATE INDEX IF NOT EXISTS idx_target_status_ssl_days_left ON target_status(ssl_days_left ASC NULLS LAST);
 CREATE INDEX IF NOT EXISTS idx_target_status_last_check_at ON target_status(last_check_at DESC NULLS LAST);
 CREATE INDEX IF NOT EXISTS idx_targets_enabled_group ON targets(enabled, "group");
+-- Screenshot rounds pick the targets whose own shot_interval has elapsed.
+-- The matching snapshot index lives at the end of this file, because
+-- last_snapshot_at is only added by the compatibility ALTERs down there.
+CREATE INDEX IF NOT EXISTS idx_target_status_last_screenshot_at
+    ON target_status(last_screenshot_at ASC NULLS FIRST);
 
 -- 全局系统设置
 CREATE TABLE IF NOT EXISTS global_settings (
@@ -217,3 +226,8 @@ ALTER TABLE targets ADD COLUMN IF NOT EXISTS snapshot_interval INTEGER DEFAULT 2
 ALTER TABLE target_status ADD COLUMN IF NOT EXISTS dns_server TEXT;
 ALTER TABLE target_status ADD COLUMN IF NOT EXISTS last_snapshot_id BIGINT;
 ALTER TABLE target_status ADD COLUMN IF NOT EXISTS last_snapshot_at TIMESTAMPTZ;
+
+-- Snapshot rounds pick the targets whose own snapshot_interval has elapsed.
+-- Must come after the ALTER above that creates the column.
+CREATE INDEX IF NOT EXISTS idx_target_status_last_snapshot_at
+    ON target_status(last_snapshot_at ASC NULLS FIRST);

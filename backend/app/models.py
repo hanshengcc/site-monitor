@@ -38,7 +38,11 @@ class Target(Base):
     created_at = Column(DateTime(timezone=True), default=utc_now)
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
-    status = relationship("TargetStatus", uselist=False, back_populates="target", lazy="joined", cascade="all, delete-orphan", passive_deletes=True)
+    # lazy="select", not "joined": with an eager default every `select(Target)` in the
+    # app silently LEFT JOINs target_status, including the check/screenshot/snapshot
+    # rounds that load every enabled target and never touch .status. The two API
+    # endpoints that do need it ask for it explicitly with joinedload().
+    status = relationship("TargetStatus", uselist=False, back_populates="target", lazy="select", cascade="all, delete-orphan", passive_deletes=True)
 
 
 class GlobalSetting(Base):

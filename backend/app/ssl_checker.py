@@ -24,6 +24,32 @@ from urllib.parse import urlparse
 from loguru import logger
 
 
+# ssl.create_default_context() loads and parses the system CA bundle from disk on
+# every call. At tens of thousands of checks per round that is pure overhead, and
+# the contexts are stateless once configured, so build each one exactly once.
+_STRICT_CTX: Optional[ssl.SSLContext] = None
+_LAX_CTX: Optional[ssl.SSLContext] = None
+
+
+def _get_strict_context() -> ssl.SSLContext:
+    """Fully verifying context (check_hostname + CERT_REQUIRED are the defaults)."""
+    global _STRICT_CTX
+    if _STRICT_CTX is None:
+        _STRICT_CTX = ssl.create_default_context()
+    return _STRICT_CTX
+
+
+def _get_lax_context() -> ssl.SSLContext:
+    """Non-verifying context, used only to read cert details after a failure."""
+    global _LAX_CTX
+    if _LAX_CTX is None:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        _LAX_CTX = ctx
+    return _LAX_CTX
+
+
 def _parse_cert_time(s: str) -> Optional[datetime]:
     """Parse OpenSSL time string like 'Jul  9 02:32:55 2026 GMT'."""
     if not s:
@@ -96,8 +122,7 @@ async def check_ssl_cert(
     }
 
     # ---- Step 1: Try with FULL verification to detect issues ----
-    ctx_strict = ssl.create_default_context()
-    # check_hostname + CERT_REQUIRED is the default for create_default_context
+    ctx_strict = _get_strict_context()
 
     try:
         reader, writer = await asyncio.wait_for(
@@ -153,9 +178,7 @@ async def _try_get_cert_details(
     result: dict, host: str, port: int, timeout: float, warn_days: int,
 ):
     """Try to retrieve cert details without verification (for diagnostic info)."""
-    ctx_lax = ssl.create_default_context()
-    ctx_lax.check_hostname = False
-    ctx_lax.verify_mode = ssl.CERT_NONE
+    ctx_lax = _get_lax_context()
 
     try:
         reader, writer = await asyncio.wait_for(

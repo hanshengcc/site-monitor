@@ -8,7 +8,7 @@ from typing import Optional, List
 from loguru import logger
 from playwright.async_api import async_playwright, Browser, Error as PlaywrightError
 from PIL import Image
-from sqlalchemy import select
+from sqlalchemy import or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 
 from backend.app.config import settings
@@ -16,6 +16,13 @@ from backend.app.database import AsyncSessionLocal
 from backend.app.models import Target, Screenshot, TargetStatus, Anomaly
 from backend.app.analyzer import analyze_screenshot
 
+
+def _due_cutoff(interval_column: str):
+    """SQL expression for "older than this target's own interval", in seconds."""
+    return text(f"now() - (targets.{interval_column} * interval '1 second')")
+
+
+_pending_snapshot_tasks: set = set()
 
 _browser: Optional[Browser] = None
 _playwright = None
@@ -178,13 +185,17 @@ async def _do_take_screenshot(target_id: int, url: str) -> Optional[dict]:
         try:
             from backend.app.snapshoter import _save_snapshot_bytes
             html_content = await page.content()
-            asyncio.create_task(_save_snapshot_bytes(
+            # Keep a strong reference: a bare create_task() result is only weakly
+            # held by the loop and can be garbage-collected mid-flight.
+            task = asyncio.create_task(_save_snapshot_bytes(
                 target_id=target_id,
                 url=url,
                 html_content=html_content,
                 page_title=page_title,
                 dom_text_length=dom_text_length,
             ))
+            _pending_snapshot_tasks.add(task)
+            task.add_done_callback(_pending_snapshot_tasks.discard)
         except Exception as e:
             logger.debug(f"[{target_id}] Auto-snapshot during screenshot skipped: {e}")
 
@@ -346,9 +357,15 @@ async def _save_and_analyze_batch(batch_results: List[dict]) -> int:
     return saved
 
 
-async def run_screenshots(max_targets: Optional[int] = None):
-    """Run screenshot round in batches to prevent memory bloat and process leaks."""
-    logger.info("Starting screenshot round...")
+async def run_screenshots(max_targets: Optional[int] = None, force: bool = False):
+    """Run screenshot round in batches to prevent memory bloat and process leaks.
+
+    By default only targets whose per-target shot_interval has elapsed are captured.
+    Rendering every enabled target every round is what made a round take hours at
+    scale — at 8 concurrent browsers, tens of thousands of pages cannot complete
+    inside the scheduled interval. Pass force=True for a manual full sweep.
+    """
+    logger.info(f"Starting screenshot round{' (forced, all targets)' if force else ''}...")
 
     try:
         async with AsyncSessionLocal() as session:
@@ -362,6 +379,11 @@ async def run_screenshots(max_targets: Optional[int] = None):
                     Target.id.asc(),
                 )
             )
+            if not force:
+                stmt = stmt.where(or_(
+                    TargetStatus.last_screenshot_at.is_(None),
+                    TargetStatus.last_screenshot_at < _due_cutoff("shot_interval"),
+                ))
             if max_targets:
                 stmt = stmt.limit(max_targets)
             rows = await session.execute(stmt)

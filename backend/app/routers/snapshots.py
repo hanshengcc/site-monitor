@@ -269,15 +269,12 @@ async def delete_snapshot(snapshot_id: int, db: AsyncSession = Depends(get_db)):
     if not snapshot:
         raise HTTPException(404, "Snapshot not found")
 
-    # Remove file on disk
-    if snapshot.file_path:
-        full_path = Path(settings.snapshots_dir) / snapshot.file_path
-        if full_path.exists():
-            try:
-                full_path.unlink()
-            except OSError:
-                pass
+    from backend.app.snapshoter import unlink_unreferenced_snapshot_files
 
+    file_path = snapshot.file_path
     await db.delete(snapshot)
+    await db.flush()
+    # Only remove the archive if no other snapshot still points at it.
+    await unlink_unreferenced_snapshot_files(db, [file_path])
     await db.commit()
     return {"ok": True, "message": "Snapshot deleted"}

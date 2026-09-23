@@ -2,12 +2,13 @@
 import asyncio
 import ssl
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
 from loguru import logger
-from sqlalchemy import select, text
+from sqlalchemy import case, func, select, text
+from sqlalchemy import insert as sa_insert
 from sqlalchemy.dialects.postgresql import insert
 
 from backend.app.config import settings
@@ -18,18 +19,30 @@ from backend.app.models import Target, CheckResult, TargetStatus, Anomaly
 check_progress = {"running": False, "total": 0, "done": 0, "ok": 0, "fail": 0, "group": None}
 
 
+# Building this context loads the system CA bundle from disk, so it is built once
+# and shared. The context is stateless after configuration and safe to reuse.
+_PERMISSIVE_CTX: Optional[ssl.SSLContext] = None
+
+# Upper bound on response body read when a keyword must be matched. The keyword
+# check itself only ever looked at the first 50k characters.
+MAX_BODY_BYTES = 256 * 1024
+
+
 def _make_ssl_context() -> ssl.SSLContext:
-    """Create a permissive SSL context that works with broken/legacy TLS servers."""
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    # Allow legacy renegotiation for old servers
-    ctx.options |= ssl.OP_LEGACY_SERVER_CONNECT if hasattr(ssl, 'OP_LEGACY_SERVER_CONNECT') else 0
-    # Set minimum TLS to 1.0 for maximum compatibility
-    ctx.minimum_version = ssl.TLSVersion.TLSv1
-    # Permissive ciphers
-    ctx.set_ciphers('DEFAULT:@SECLEVEL=1')
-    return ctx
+    """Get the shared permissive SSL context that works with broken/legacy TLS servers."""
+    global _PERMISSIVE_CTX
+    if _PERMISSIVE_CTX is None:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        # Allow legacy renegotiation for old servers
+        ctx.options |= ssl.OP_LEGACY_SERVER_CONNECT if hasattr(ssl, 'OP_LEGACY_SERVER_CONNECT') else 0
+        # Set minimum TLS to 1.0 for maximum compatibility
+        ctx.minimum_version = ssl.TLSVersion.TLSv1
+        # Permissive ciphers
+        ctx.set_ciphers('DEFAULT:@SECLEVEL=1')
+        _PERMISSIVE_CTX = ctx
+    return _PERMISSIVE_CTX
 
 
 def _is_ssl_error(exc: Exception) -> bool:
@@ -53,9 +66,13 @@ async def check_single(
     follow_redirects: bool = True,
     custom_headers: Optional[dict] = None,
     retry_http_on_ssl_error: bool = True,
+    check_ssl_cert: bool = True,
 ) -> dict:
     """Check a single URL with custom parameters.
     If HTTPS fails due to SSL error, automatically retry with HTTP.
+
+    check_ssl_cert=False skips the extra verifying TLS handshake; callers use it
+    when a recent certificate result is already on record (see settings.ssl_recheck_hours).
     """
     result = await _do_check(
         client, target_id, url,
@@ -68,7 +85,7 @@ async def check_single(
     )
 
     # ---- SSL certificate check (for HTTPS URLs that got HTTP 200) ----
-    if result["is_ok"] and url.startswith("https://"):
+    if check_ssl_cert and result["is_ok"] and url.startswith("https://"):
         try:
             from backend.app.ssl_checker import check_ssl_for_url
             ssl_info = await check_ssl_for_url(url, timeout=10, warn_days=30)
@@ -106,6 +123,40 @@ async def check_single(
     return result
 
 
+async def _fetch_status_and_body(
+    client: httpx.AsyncClient,
+    url: str,
+    follow_redirects: bool,
+    request_timeout: int,
+    headers: dict,
+    need_body: bool,
+) -> tuple[int, str]:
+    """Fetch a URL, reading only as much of the body as the check actually needs.
+
+    Without a keyword to match, the body is never inspected, so it is never read:
+    the response is closed right after the headers arrive. Across tens of thousands
+    of targets this removes the bulk of the bandwidth, memory and time of a round.
+    """
+    async with client.stream(
+        "GET", url,
+        follow_redirects=follow_redirects,
+        timeout=request_timeout,
+        headers=headers,
+    ) as resp:
+        if not need_body:
+            return resp.status_code, ""
+
+        chunks: list[bytes] = []
+        read = 0
+        async for chunk in resp.aiter_bytes():
+            chunks.append(chunk)
+            read += len(chunk)
+            if read >= MAX_BODY_BYTES:
+                break
+        body = b"".join(chunks).decode(resp.encoding or "utf-8", errors="replace")
+        return resp.status_code, body
+
+
 async def _do_check(
     client: httpx.AsyncClient,
     target_id: int,
@@ -135,9 +186,12 @@ async def _do_check(
     from backend.app.domain_detector import detect_domain_status, DomainVerdict
 
     # Perform HTTP request and authoritative DNS server inspection concurrently
-    http_task = client.get(
-        url, follow_redirects=follow_redirects,
-        timeout=request_timeout, headers=headers,
+    http_task = _fetch_status_and_body(
+        client, url,
+        follow_redirects=follow_redirects,
+        request_timeout=request_timeout,
+        headers=headers,
+        need_body=bool(expect_keyword),
     )
     dns_task = detect_domain_status(
         url,
@@ -189,16 +243,16 @@ async def _do_check(
             result["error"] = f"{type(http_res).__name__}: {err_str[:200]}"
         return result
 
-    resp = http_res
-    result["status_code"] = resp.status_code
+    status_code, body = http_res
+    result["status_code"] = status_code
 
-    if resp.status_code != expect_status:
+    if status_code != expect_status:
         result["is_ok"] = False
-        result["error"] = f"expected {expect_status}, got {resp.status_code}"
+        result["error"] = f"expected {expect_status}, got {status_code}"
         return result
 
     if expect_keyword:
-        if expect_keyword not in resp.text[:50000]:
+        if expect_keyword not in body[:50000]:
             result["is_ok"] = False
             result["error"] = f"keyword '{expect_keyword}' not found"
             return result
@@ -239,110 +293,188 @@ async def _db_writer(queue: asyncio.Queue, batch_size: int = 20):
                 buffer = []
 
 
+SSL_STATUS_COLUMNS = (
+    "ssl_valid", "ssl_error", "ssl_issuer", "ssl_subject",
+    "ssl_not_after", "ssl_days_left", "ssl_warning", "ssl_checked_at",
+)
+
+
+def _parse_ssl_not_after(raw) -> Optional[datetime]:
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except (ValueError, TypeError):
+        return None
+
+
+def _build_status_values(result: dict, dns_server, ssl_info) -> dict:
+    """Build one row of target_status upsert values from a check result.
+
+    Every row carries the same columns so the whole batch can go up as a single
+    multi-row INSERT ... ON CONFLICT. Columns with no new reading are left NULL
+    and preserved by the conflict clause rather than overwriting good data.
+    """
+    values = {
+        "target_id": result["target_id"],
+        "is_ok": result["is_ok"],
+        "last_check_at": result["checked_at"],
+        "last_status_code": result["status_code"],
+        "last_latency_ms": result["latency_ms"],
+        "last_error": result["error"],
+        "consecutive_fails": 0 if result["is_ok"] else 1,
+        "dns_server": dns_server,
+    }
+    values.update({col: None for col in SSL_STATUS_COLUMNS})
+    if ssl_info:
+        values.update({
+            "ssl_valid": ssl_info.get("ssl_valid"),
+            "ssl_error": ssl_info.get("ssl_error"),
+            "ssl_issuer": ssl_info.get("ssl_issuer"),
+            "ssl_subject": ssl_info.get("ssl_subject"),
+            "ssl_not_after": _parse_ssl_not_after(ssl_info.get("ssl_not_after")),
+            "ssl_days_left": ssl_info.get("ssl_days_left"),
+            "ssl_warning": ssl_info.get("ssl_warning"),
+            "ssl_checked_at": result["checked_at"],
+        })
+    return values
+
+
+def _status_upsert_statement(rows: list[dict]):
+    """Multi-row upsert into target_status, returning each row's new fail streak."""
+    stmt = insert(TargetStatus).values(rows)
+    excluded = stmt.excluded
+    set_ = {
+        "is_ok": excluded.is_ok,
+        "last_check_at": excluded.last_check_at,
+        "last_status_code": excluded.last_status_code,
+        "last_latency_ms": excluded.last_latency_ms,
+        "last_error": excluded.last_error,
+        "consecutive_fails": case(
+            (excluded.is_ok.is_(True), 0),
+            else_=TargetStatus.consecutive_fails + 1,
+        ),
+        # A round without a DNS answer must not erase the last known nameserver.
+        "dns_server": func.coalesce(excluded.dns_server, TargetStatus.dns_server),
+    }
+    # ssl_checked_at acts as the "this row carries fresh cert data" marker: when it
+    # is NULL the existing certificate columns are kept untouched.
+    for col in SSL_STATUS_COLUMNS:
+        set_[col] = case(
+            (excluded.ssl_checked_at.isnot(None), getattr(excluded, col)),
+            else_=getattr(TargetStatus, col),
+        )
+    return stmt.on_conflict_do_update(
+        index_elements=["target_id"], set_=set_,
+    ).returning(TargetStatus.target_id, TargetStatus.consecutive_fails)
+
+
+# Resolving open anomalies for every recovered target, in one statement.
+_RESOLVE_ANOMALIES_SQL = text("""
+    UPDATE anomalies AS a
+       SET state = 'resolved',
+           resolved_at = v.ts,
+           notified = NOT a.notified
+      FROM (
+        SELECT unnest(CAST(:target_ids AS integer[]))     AS target_id,
+               unnest(CAST(:timestamps AS timestamptz[])) AS ts
+      ) AS v
+     WHERE a.target_id = v.target_id
+       AND a.state = 'open'
+""")
+
+
+async def _resolve_open_anomalies(session, recovered: list[tuple[int, datetime]]):
+    """Close every open anomaly for targets that just came back healthy.
+
+    Targets that had already been alerted on get notified=False so the recovery
+    notice goes out; ones that never alerted are marked notified to stay quiet.
+    """
+    if not recovered:
+        return
+    await session.execute(_RESOLVE_ANOMALIES_SQL, {
+        "target_ids": [tid for tid, _ in recovered],
+        "timestamps": [ts for _, ts in recovered],
+    })
+
+
+async def _open_http_error_anomalies(session, failing: list[tuple[dict, int]]):
+    """Open an http_error anomaly for each failing target that has none yet."""
+    if not failing:
+        return
+    target_ids = [values["target_id"] for values, _ in failing]
+    already_open = set((await session.execute(
+        select(Anomaly.target_id).where(
+            Anomaly.target_id.in_(target_ids),
+            Anomaly.anomaly_type == "http_error",
+            Anomaly.state == "open",
+        )
+    )).scalars().all())
+
+    new_anomalies = []
+    for values, fails in failing:
+        if values["target_id"] in already_open:
+            continue
+        error_desc = values["last_error"] or f"HTTP {values['last_status_code']}"
+        new_anomalies.append({
+            "target_id": values["target_id"],
+            "detected_at": values["last_check_at"],
+            "anomaly_type": "http_error",
+            "score": min(100.0, 30.0 + fails * 10),
+            "reasons": [{
+                "rule": "consecutive_fails",
+                "detail": f"连续失败 {fails} 次: {error_desc}",
+            }],
+            "state": "open",
+            "notified": False,
+        })
+
+    if new_anomalies:
+        await session.execute(sa_insert(Anomaly), new_anomalies)
+
+
 async def _flush_buffer(buffer: list):
-    """Write a batch of results to DB in a single session."""
+    """Write a batch of results to DB using a handful of set-based statements.
+
+    The previous implementation issued three or more round trips per result, which
+    at tens of thousands of targets per round dominated the check duration. This
+    version costs a fixed number of statements per batch regardless of batch size.
+    """
     if not buffer:
         return
     try:
+        check_rows: list[dict] = []
+        # Last reading wins if a target somehow appears twice: PostgreSQL rejects an
+        # ON CONFLICT DO UPDATE that would touch the same row twice in one statement.
+        status_rows: dict[int, dict] = {}
+
+        for r in buffer:
+            ssl_info = r.pop("ssl_info", None)
+            dns_server = r.pop("dns_server", None)
+            check_rows.append(dict(r))
+            status_rows[r["target_id"]] = _build_status_values(r, dns_server, ssl_info)
+
         async with AsyncSessionLocal() as session:
-            for r in buffer:
-                # Extract non-CheckResult fields before saving CheckResult
-                ssl_info = r.pop("ssl_info", None)
-                dns_server = r.pop("dns_server", None)
+            await session.execute(sa_insert(CheckResult), check_rows)
 
-                session.add(CheckResult(**r))
+            result = await session.execute(_status_upsert_statement(list(status_rows.values())))
+            fails_by_target = dict(result.all())
 
-                # Build upsert values for target_status
-                upsert_vals = {
-                    "target_id": r["target_id"],
-                    "is_ok": r["is_ok"],
-                    "last_check_at": r["checked_at"],
-                    "last_status_code": r["status_code"],
-                    "last_latency_ms": r["latency_ms"],
-                    "last_error": r["error"],
-                    "consecutive_fails": 0 if r["is_ok"] else 1,
-                }
-                update_set = {
-                    "is_ok": r["is_ok"],
-                    "last_check_at": r["checked_at"],
-                    "last_status_code": r["status_code"],
-                    "last_latency_ms": r["latency_ms"],
-                    "last_error": r["error"],
-                    "consecutive_fails": (
-                        0 if r["is_ok"]
-                        else text("target_status.consecutive_fails + 1")
-                    ),
-                }
-                if dns_server:
-                    upsert_vals["dns_server"] = dns_server
-                    update_set["dns_server"] = dns_server
+            recovered = [
+                (values["target_id"], values["last_check_at"])
+                for values in status_rows.values() if values["is_ok"]
+            ]
+            failing = [
+                (values, fails_by_target.get(values["target_id"], 1))
+                for values in status_rows.values() if not values["is_ok"]
+            ]
+            failing = [
+                (values, fails) for values, fails in failing
+                if fails >= settings.consecutive_fails_threshold
+            ]
 
-                # Add SSL cert info if present
-                if ssl_info:
-                    ssl_not_after = None
-                    if ssl_info.get("ssl_not_after"):
-                        try:
-                            from datetime import datetime as _dt
-                            ssl_not_after = _dt.fromisoformat(ssl_info["ssl_not_after"])
-                        except (ValueError, TypeError):
-                            pass
-                    ssl_fields = {
-                        "ssl_valid": ssl_info.get("ssl_valid"),
-                        "ssl_error": ssl_info.get("ssl_error"),
-                        "ssl_issuer": ssl_info.get("ssl_issuer"),
-                        "ssl_subject": ssl_info.get("ssl_subject"),
-                        "ssl_not_after": ssl_not_after,
-                        "ssl_days_left": ssl_info.get("ssl_days_left"),
-                        "ssl_warning": ssl_info.get("ssl_warning"),
-                        "ssl_checked_at": r["checked_at"],
-                    }
-                    upsert_vals.update(ssl_fields)
-                    update_set.update(ssl_fields)
-
-                stmt = insert(TargetStatus).values(**upsert_vals).on_conflict_do_update(
-                    index_elements=["target_id"],
-                    set_=update_set,
-                ).returning(TargetStatus.consecutive_fails)
-                res = await session.execute(stmt)
-                row = res.fetchone()
-                curr_fails = row[0] if row else (0 if r["is_ok"] else 1)
-
-                if not r["is_ok"]:
-                    if curr_fails >= settings.consecutive_fails_threshold:
-                        # Check if there's already an open http_error anomaly
-                        existing = await session.execute(
-                            select(Anomaly).where(
-                                Anomaly.target_id == r["target_id"],
-                                Anomaly.anomaly_type == "http_error",
-                                Anomaly.state == "open",
-                            )
-                        )
-                        if not existing.scalar_one_or_none():
-                            err_desc = r.get("error") or f"HTTP {r.get('status_code')}"
-                            anomaly = Anomaly(
-                                target_id=r["target_id"],
-                                detected_at=r["checked_at"],
-                                anomaly_type="http_error",
-                                score=min(100.0, 30.0 + curr_fails * 10),
-                                reasons=[{"rule": "consecutive_fails", "detail": f"连续失败 {curr_fails} 次: {err_desc}"}],
-                                state="open",
-                                notified=False,
-                            )
-                            session.add(anomaly)
-                else:
-                    # Auto-resolve previously open anomalies for this target
-                    open_anomalies = await session.execute(
-                        select(Anomaly).where(
-                            Anomaly.target_id == r["target_id"],
-                            Anomaly.state == "open",
-                        )
-                    )
-                    for oa in open_anomalies.scalars().all():
-                        was_notified = oa.notified
-                        oa.state = "resolved"
-                        oa.resolved_at = r["checked_at"]
-                        # If previously alerted, notify about recovery; otherwise stay quiet
-                        oa.notified = False if was_notified else True
+            await _resolve_open_anomalies(session, recovered)
+            await _open_http_error_anomalies(session, failing)
 
             await session.commit()
     except Exception as e:
@@ -435,13 +567,21 @@ async def run_checks(group: Optional[str] = None):
     logger.info(f"Starting HTTP check round for {group_desc}...")
     check_progress.update({"running": True, "total": 0, "done": 0, "ok": 0, "fail": 0, "group": group})
 
-    # Load targets
+    # Load targets along with when each one's certificate was last inspected, so
+    # the extra verifying TLS handshake can be skipped for recently checked certs.
     async with AsyncSessionLocal() as session:
-        stmt = select(Target).where(Target.enabled == True)
+        stmt = (
+            select(Target, TargetStatus.ssl_checked_at)
+            .outerjoin(TargetStatus, Target.id == TargetStatus.target_id)
+            .where(Target.enabled == True)
+        )
         if group:
             stmt = stmt.where(Target.group == group)
-        rows = await session.execute(stmt)
-        targets = rows.scalars().all()
+        rows = (await session.execute(stmt)).all()
+        targets = [row[0] for row in rows]
+        ssl_checked_at_by_target = {row[0].id: row[1] for row in rows}
+
+    ssl_recheck_cutoff = datetime.now(timezone.utc) - timedelta(hours=settings.ssl_recheck_hours)
 
     if not targets:
         logger.info(f"No targets to check for {group_desc}.")
@@ -520,6 +660,9 @@ async def run_checks(group: Optional[str] = None):
                 if limiter:
                     await limiter.acquire()
 
+                last_ssl_check = ssl_checked_at_by_target.get(target.id)
+                needs_ssl_check = last_ssl_check is None or last_ssl_check < ssl_recheck_cutoff
+
                 r = await check_single(
                     client, target.id, url,
                     expect_status=target.expect_status,
@@ -528,6 +671,7 @@ async def run_checks(group: Optional[str] = None):
                     request_timeout=timeout,
                     follow_redirects=follow if follow is not None else True,
                     custom_headers=headers,
+                    check_ssl_cert=needs_ssl_check,
                 )
 
         await write_queue.put(r)

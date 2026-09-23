@@ -185,74 +185,167 @@ class DomainVerdict:
     signals: list[DomainSignal] = field(default_factory=list)
 
 
-# In-memory TTL cache for DNS query results (300 seconds TTL)
-_DNS_CACHE: dict[str, tuple[float, dict]] = {}
+# In-memory TTL caches. Bounded so a 30k-domain round cannot grow them without limit.
 _DNS_CACHE_TTL = 300.0
+_NS_CACHE_TTL = 1800.0          # Authoritative NS records change far less often than A records
+_MAX_DNS_CACHE_ENTRIES = 50000
+_MAX_NS_CACHE_ENTRIES = 20000
+
+_DNS_CACHE: dict[str, tuple[float, dict]] = {}
+_NS_CACHE: dict[str, tuple[float, dict]] = {}   # apex -> {"ns_records", "nxdomain", "error"}
+
+# De-duplicates concurrent resolutions of the same domain within one check round.
+_DNS_INFLIGHT: dict[str, asyncio.Future] = {}
+_NS_INFLIGHT: dict[str, asyncio.Future] = {}
+
+# One shared resolver. Constructing dns.asyncresolver.Resolver() re-reads and
+# re-parses /etc/resolv.conf with *blocking* file IO, which at 30k lookups per
+# round stalls the event loop for seconds. Per-query timeouts are passed to
+# resolve(lifetime=...) instead, so a single instance is safe to share.
+_RESOLVER: Optional["dns.asyncresolver.Resolver"] = None
+
+
+def _get_resolver() -> "dns.asyncresolver.Resolver":
+    global _RESOLVER
+    if _RESOLVER is None:
+        _RESOLVER = dns.asyncresolver.Resolver()
+        # Cap per-attempt time; the effective deadline comes from lifetime= per query.
+        _RESOLVER.timeout = 3.0
+    return _RESOLVER
+
+
+def _prune_cache(cache: dict, ttl: float, max_entries: int) -> None:
+    """Drop expired entries; if still oversized, drop the oldest ones."""
+    if len(cache) <= max_entries:
+        return
+    now = time.monotonic()
+    for key in [k for k, (ts, _) in cache.items() if now - ts >= ttl]:
+        cache.pop(key, None)
+    if len(cache) > max_entries:
+        overflow = len(cache) - max_entries
+        for key in sorted(cache, key=lambda k: cache[k][0])[:overflow]:
+            cache.pop(key, None)
+
+
+async def _resolve_ns(apex: str, domain: str, timeout: float) -> dict:
+    """Resolve authoritative NS records, cached per apex domain.
+
+    Many monitored targets share one apex (www./m./shop. of the same site), so
+    caching at the apex collapses those into a single NS query.
+    """
+    now = time.monotonic()
+    cached = _NS_CACHE.get(apex)
+    if cached and now - cached[0] < _NS_CACHE_TTL:
+        return cached[1]
+
+    inflight = _NS_INFLIGHT.get(apex)
+    if inflight is not None:
+        return await asyncio.shield(inflight)
+
+    future: asyncio.Future = asyncio.get_running_loop().create_future()
+    _NS_INFLIGHT[apex] = future
+    try:
+        resolver = _get_resolver()
+        ns_result = {"ns_records": [], "nxdomain": False, "error": None}
+
+        # Authoritative NS records live at the zone apex. If the apex returns
+        # NoAnswer, fall back to querying the full hostname.
+        for d in ([apex] if apex == domain else [apex, domain]):
+            try:
+                answers = await resolver.resolve(d, "NS", lifetime=timeout)
+                ns_result["ns_records"] = [str(r.target).rstrip(".").lower() for r in answers]
+                if ns_result["ns_records"]:
+                    break
+            except dns.resolver.NXDOMAIN:
+                ns_result["nxdomain"] = True
+                break
+            except (dns.resolver.NoAnswer, dns.resolver.NoNameservers):
+                continue
+            except Exception as e:
+                ns_result["error"] = str(e)
+                break
+
+        _NS_CACHE[apex] = (now, ns_result)
+        _prune_cache(_NS_CACHE, _NS_CACHE_TTL, _MAX_NS_CACHE_ENTRIES)
+        if not future.done():
+            future.set_result(ns_result)
+        return ns_result
+    except BaseException as e:
+        if not future.done():
+            future.set_exception(e)
+        raise
+    finally:
+        _NS_INFLIGHT.pop(apex, None)
+
+
+async def _query_a(domain: str, timeout: float) -> tuple[list, bool]:
+    """Resolve A records. Returns (addresses, nxdomain)."""
+    try:
+        answers = await _get_resolver().resolve(domain, "A", lifetime=timeout)
+        return [r.address for r in answers], False
+    except dns.resolver.NXDOMAIN:
+        return [], True
+    except Exception:
+        return [], False
+
+
+async def _query_cname(domain: str, timeout: float) -> list:
+    """Resolve CNAME records (best effort)."""
+    try:
+        answers = await _get_resolver().resolve(domain, "CNAME", lifetime=timeout)
+        return [str(r.target).rstrip(".").lower() for r in answers]
+    except Exception:
+        return []
 
 
 async def _resolve_dns(domain: str, timeout: float = 3.0) -> dict:
-    """Resolve DNS records for domain with in-memory caching and apex NS fallback."""
+    """Resolve DNS records for domain with in-memory caching and apex NS fallback.
+
+    The NS, A and CNAME lookups run concurrently instead of serially, so one
+    domain costs one round-trip of latency rather than three.
+    """
     now = time.monotonic()
-    if domain in _DNS_CACHE:
-        ts, cached = _DNS_CACHE[domain]
-        if now - ts < _DNS_CACHE_TTL:
-            return cached
+    cached = _DNS_CACHE.get(domain)
+    if cached and now - cached[0] < _DNS_CACHE_TTL:
+        return cached[1]
 
-    apex = get_apex_domain(domain)
-    resolver = dns.asyncresolver.Resolver()
-    resolver.lifetime = timeout
-    resolver.timeout = timeout
+    inflight = _DNS_INFLIGHT.get(domain)
+    if inflight is not None:
+        return await asyncio.shield(inflight)
 
-    result = {
-        "domain": domain,
-        "apex": apex,
-        "a_records": [],
-        "ns_records": [],
-        "cname_records": [],
-        "nxdomain": False,
-        "no_nameservers": False,
-        "error": None,
-    }
+    future: asyncio.Future = asyncio.get_running_loop().create_future()
+    _DNS_INFLIGHT[domain] = future
+    try:
+        apex = get_apex_domain(domain)
+        ns_result, (a_records, a_nxdomain), cname_records = await asyncio.gather(
+            _resolve_ns(apex, domain, timeout),
+            _query_a(domain, timeout),
+            _query_cname(domain, timeout),
+        )
 
-    # 1. Query NS records
-    # Authoritative NS records live at the zone apex. If querying subdomain returns
-    # NoAnswer, fall back to apex.
-    targets_for_ns = [apex] if apex == domain else [apex, domain]
-    for d in targets_for_ns:
-        try:
-            answers = await resolver.resolve(d, "NS")
-            result["ns_records"] = [str(r.target).rstrip(".").lower() for r in answers]
-            if result["ns_records"]:
-                break
-        except dns.resolver.NXDOMAIN:
-            result["nxdomain"] = True
-            break
-        except (dns.resolver.NoAnswer, dns.resolver.NoNameservers):
-            continue
-        except Exception as e:
-            result["error"] = str(e)
-            break
+        nxdomain = bool(ns_result["nxdomain"] or a_nxdomain)
+        result = {
+            "domain": domain,
+            "apex": apex,
+            "a_records": [] if nxdomain else a_records,
+            "ns_records": ns_result["ns_records"],
+            "cname_records": [] if nxdomain else cname_records,
+            "nxdomain": nxdomain,
+            "no_nameservers": False,
+            "error": ns_result["error"],
+        }
 
-    # 2. If not already NXDOMAIN, query A and CNAME records
-    if not result["nxdomain"]:
-        try:
-            answers = await resolver.resolve(domain, "A")
-            result["a_records"] = [r.address for r in answers]
-        except dns.resolver.NXDOMAIN:
-            result["nxdomain"] = True
-        except (dns.resolver.NoAnswer, dns.resolver.NoNameservers):
-            pass
-        except Exception:
-            pass
-
-        try:
-            answers = await resolver.resolve(domain, "CNAME")
-            result["cname_records"] = [str(r.target).rstrip(".").lower() for r in answers]
-        except Exception:
-            pass
-
-    _DNS_CACHE[domain] = (now, result)
-    return result
+        _DNS_CACHE[domain] = (now, result)
+        _prune_cache(_DNS_CACHE, _DNS_CACHE_TTL, _MAX_DNS_CACHE_ENTRIES)
+        if not future.done():
+            future.set_result(result)
+        return result
+    except BaseException as e:
+        if not future.done():
+            future.set_exception(e)
+        raise
+    finally:
+        _DNS_INFLIGHT.pop(domain, None)
 
 
 def _check_ns_signals(ns_records: list[str]) -> Optional[DomainSignal]:

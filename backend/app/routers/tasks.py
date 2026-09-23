@@ -58,8 +58,12 @@ async def get_scheduler_status():
 
 @router.post("/screenshot-all")
 async def trigger_screenshot_all():
-    """Manually trigger a full screenshot round (async background)."""
-    asyncio.create_task(run_screenshots())
+    """Manually trigger a full screenshot round (async background).
+
+    force=True so an explicit manual sweep still covers every target, while the
+    scheduled round only captures targets whose shot_interval has elapsed.
+    """
+    asyncio.create_task(run_screenshots(force=True))
     return {"message": "Screenshot round triggered"}
 
 
@@ -67,7 +71,7 @@ async def trigger_screenshot_all():
 async def trigger_snapshot_all():
     """Manually trigger a full snapshot round (async background)."""
     from backend.app.snapshoter import run_snapshots
-    asyncio.create_task(run_snapshots())
+    asyncio.create_task(run_snapshots(force=True))
     return {"message": "Snapshot round triggered"}
 
 

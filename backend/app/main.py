@@ -7,6 +7,7 @@ from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from loguru import logger
 from sqlalchemy import select
 
@@ -100,10 +101,40 @@ async def init_db_schema():
             await session.execute(text("CREATE INDEX IF NOT EXISTS idx_snapshots_hash ON snapshots(target_id, content_hash)"))
             await session.execute(text("ALTER TABLE target_status ADD COLUMN IF NOT EXISTS last_snapshot_id BIGINT"))
             await session.execute(text("ALTER TABLE target_status ADD COLUMN IF NOT EXISTS last_snapshot_at TIMESTAMPTZ"))
+            # Every check round looks up open anomalies by target; a partial index
+            # keeps that lookup proportional to open anomalies, not to all history.
+            await session.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_anomalies_open_by_target "
+                "ON anomalies(target_id, anomaly_type) WHERE state = 'open'"
+            ))
+            # Screenshot/snapshot rounds select targets whose interval has elapsed.
+            await session.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_target_status_last_screenshot_at "
+                "ON target_status(last_screenshot_at ASC NULLS FIRST)"
+            ))
+            await session.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_target_status_last_snapshot_at "
+                "ON target_status(last_snapshot_at ASC NULLS FIRST)"
+            ))
             await session.commit()
             logger.info("Database schema auto-check completed.")
     except Exception as e:
         logger.warning(f"Database schema auto-check warning: {e}")
+
+    # Trigram index for the targets list search box (ILIKE '%term%'), which is a
+    # sequential scan without it. Needs the pg_trgm extension, which may not be
+    # grantable — keep it in its own transaction so a failure cannot roll back
+    # the schema work above.
+    try:
+        async with AsyncSessionLocal() as session:
+            await session.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+            await session.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_targets_url_trgm "
+                "ON targets USING gin (url gin_trgm_ops)"
+            ))
+            await session.commit()
+    except Exception as e:
+        logger.info(f"Skipping trigram search index (pg_trgm unavailable): {e}")
 
 
 @asynccontextmanager
@@ -138,6 +169,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Compress JS/CSS bundles, JSON list responses and CSV exports. The frontend
+# bundle alone is ~1.6MB of highly compressible text.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+
 # CORS (allow frontend dev server)
 app.add_middleware(
     CORSMiddleware,
@@ -146,6 +181,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def static_cache_headers_middleware(request: Request, call_next):
+    """Let browsers cache hashed build assets permanently.
+
+    Vite fingerprints every file under /assets, so a given URL's content can never
+    change and revalidation requests are pure waste.
+    """
+    response = await call_next(request)
+    if request.url.path.startswith("/assets/"):
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    return response
 
 
 @app.middleware("http")
@@ -179,7 +227,11 @@ async def health():
     return {"status": "ok"}
 
 
-# Serve screenshots as static files
+# Serve screenshots as static files. The directories must exist before the mount,
+# which runs at import time — lifespan startup is too late and a missing directory
+# would make the whole app fail to import on a fresh deployment.
+Path(settings.screenshots_dir).mkdir(parents=True, exist_ok=True)
+Path(settings.snapshots_dir).mkdir(parents=True, exist_ok=True)
 app.mount("/screenshots", StaticFiles(directory=settings.screenshots_dir), name="screenshots")
 
 # Serve frontend (production build) with SPA fallback

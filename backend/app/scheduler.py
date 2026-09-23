@@ -1,6 +1,7 @@
 """Scheduler - manages periodic check and screenshot tasks."""
 import asyncio
-from datetime import datetime, timezone
+import re
+from datetime import date, datetime, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from loguru import logger
@@ -73,6 +74,47 @@ async def _safe_run_snapshots():
                 pass
 
 
+PARTITION_NAME_PATTERN = re.compile(r"^check_results_(\d{4})_(\d{2})$")
+
+
+def is_partition_expired(partition_name: str, cutoff) -> bool:
+    """True when every row a partition can hold predates cutoff.
+
+    Partitions are named check_results_YYYY_MM by create_monthly_partitions() and
+    span exactly one month. A partition is expired only once its month has fully
+    ended before the cutoff, so the month being trimmed is never dropped. Names
+    that do not match the pattern are never considered expired.
+    """
+    match = PARTITION_NAME_PATTERN.match(partition_name)
+    if not match:
+        return False
+    year, month = int(match.group(1)), int(match.group(2))
+    if not 1 <= month <= 12:
+        return False
+    month_end = date(year + month // 12, month % 12 + 1, 1)
+    return month_end < cutoff.date()
+
+
+async def _drop_expired_partitions(session, cutoff) -> list[str]:
+    """Drop every check_results partition whose whole month predates cutoff."""
+    from sqlalchemy import text
+
+    rows = await session.execute(text("""
+        SELECT c.relname
+          FROM pg_inherits i
+          JOIN pg_class c ON c.oid = i.inhrelid
+          JOIN pg_class p ON p.oid = i.inhparent
+         WHERE p.relname = 'check_results'
+    """))
+
+    expired = [name for (name,) in rows.all() if is_partition_expired(name, cutoff)]
+    for name in expired:
+        await session.execute(text(f'DROP TABLE IF EXISTS "{name}"'))
+
+    await session.commit()
+    return expired
+
+
 async def run_daily_maintenance():
     """Daily maintenance:
     1. Ensure future monthly partitions exist.
@@ -97,17 +139,17 @@ async def run_daily_maintenance():
         except Exception as e:
             logger.warning(f"Failed to create monthly partitions: {e}")
 
-        # 2. Clean old check results (>30 days)
+        # 2. Clean old check results (>30 days) by dropping whole monthly partitions.
+        #    A row-wise DELETE over a partitioned table with tens of millions of rows
+        #    scans every partition and bloats the heap; dropping the partitions whose
+        #    entire range predates the cutoff is near-instant and reclaims disk at once.
         cutoff_30d = now - timedelta(days=30)
         try:
-            res = await session.execute(
-                delete(CheckResult).where(CheckResult.checked_at < cutoff_30d)
-            )
-            await session.commit()
-            if res.rowcount and res.rowcount > 0:
-                logger.info(f"Cleaned up {res.rowcount} old check_results records (>30 days).")
+            dropped = await _drop_expired_partitions(session, cutoff_30d)
+            if dropped:
+                logger.info(f"Dropped {len(dropped)} expired check_results partitions: {', '.join(dropped)}")
         except Exception as e:
-            logger.warning(f"Failed to clean old check_results: {e}")
+            logger.warning(f"Failed to drop expired check_results partitions: {e}")
 
         # 3. Clean old normal screenshots (>14 days)
         cutoff_14d = now - timedelta(days=14)
@@ -158,19 +200,16 @@ async def run_daily_maintenance():
                 Snapshot.has_changed == False,
             ).limit(1000)
             old_snaps = (await session.execute(snap_stmt)).scalars().all()
-            snaps_dir = Path(settings.snapshots_dir)
-            deleted_snaps = 0
+            snap_paths = [s.file_path for s in old_snaps]
 
             for snap in old_snaps:
-                if snap.file_path:
-                    sp = snaps_dir / snap.file_path
-                    if sp.exists():
-                        try:
-                            sp.unlink()
-                            deleted_snaps += 1
-                        except OSError:
-                            pass
                 await session.delete(snap)
+            await session.flush()
+
+            # Unchanged snapshots share the archive of the last changed one, so
+            # files are removed only once nothing references them any more.
+            from backend.app.snapshoter import unlink_unreferenced_snapshot_files
+            deleted_snaps = await unlink_unreferenced_snapshot_files(session, snap_paths)
 
             await session.commit()
             if old_snaps:
