@@ -32,11 +32,15 @@ if echo "$DIFF_FILES" | grep -q "requirements.txt"; then
     pip install -r requirements.txt -q
 fi
 
+# Ensure required storage directories exist
+mkdir -p "$PROJECT_DIR/screenshots" "$PROJECT_DIR/snapshots"
+
 # Apply DB schema changes if init.sql changed
 if echo "$DIFF_FILES" | grep -q "init.sql"; then
     echo "Applying database updates from init.sql..."
-    if docker ps 2>/dev/null | grep -q "site-monitor-db"; then
-        docker exec -i site-monitor-db psql -U monitor -d site_monitor < init.sql 2>&1 || true
+    DB_CONTAINER=$(docker ps --filter "name=site-monitor-db" --format "{{.Names}}" 2>/dev/null | head -n 1)
+    if [ -n "$DB_CONTAINER" ]; then
+        docker exec -i "$DB_CONTAINER" psql -U monitor -d site_monitor < init.sql 2>&1 || true
     elif command -v psql >/dev/null 2>&1; then
         PGPASSWORD=monitor123 psql -h localhost -p 5433 -U monitor -d site_monitor < init.sql 2>&1 || \
         PGPASSWORD=monitor123 psql -h localhost -p 5432 -U monitor -d site_monitor < init.sql 2>&1 || true
