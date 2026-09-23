@@ -198,6 +198,35 @@ async def test_duplicate_target_in_one_batch():
 
 
 # ---------------------------------------------------------------------------
+async def test_target_deleted_mid_round():
+    print("\n[4b] Target deleted mid-round must not sink the rest of the batch")
+    now = datetime.now(timezone.utc)
+
+    async with AsyncSessionLocal() as session:
+        await reset(session)
+        await seed_targets(session, 10)
+
+    # Delete target 5 while results for 1..10 are already in flight.
+    async with AsyncSessionLocal() as session:
+        await session.execute(text("DELETE FROM targets WHERE id = 5"))
+        await session.commit()
+
+    batch = [result_row(i, True, now) for i in range(1, 11)]
+    await checker._flush_buffer(batch)
+
+    async with AsyncSessionLocal() as session:
+        stored = set((await session.execute(select(CheckResult.target_id))).scalars().all())
+        statuses = set((await session.execute(select(TargetStatus.target_id))).scalars().all())
+
+    survivors = {1, 2, 3, 4, 6, 7, 8, 9, 10}
+    check("results for the nine live targets survived", stored == survivors,
+          f"stored={sorted(stored)}")
+    check("status rows written for the nine live targets", statuses == survivors,
+          f"statuses={sorted(statuses)}")
+    check("no orphan result for the deleted target", 5 not in stored, "target 5 absent")
+
+
+# ---------------------------------------------------------------------------
 async def test_write_throughput():
     print(f"\n[5] Write throughput at production scale ({SEED_TARGETS} targets)")
     async with AsyncSessionLocal() as session:
@@ -399,6 +428,7 @@ async def main():
     await test_flush_semantics()
     await test_ssl_column_preservation()
     await test_duplicate_target_in_one_batch()
+    await test_target_deleted_mid_round()
     new_elapsed = await test_write_throughput()
     old_elapsed = await test_legacy_write_throughput()
     # Re-seed the optimised state for the read tests.

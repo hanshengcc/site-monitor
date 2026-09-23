@@ -9,6 +9,7 @@ from backend.app import domain_detector
 from backend.app.checker import (
     SSL_STATUS_COLUMNS,
     _build_status_values,
+    _drop_missing_targets,
     _status_upsert_statement,
 )
 from backend.app.scheduler import is_partition_expired
@@ -89,6 +90,52 @@ class TestStatusUpsertValues:
         assert "ELSE target_status.ssl_issuer" in sql
         # The new fail streak comes back without a follow-up query
         assert "RETURNING target_status.target_id, target_status.consecutive_fails" in sql
+
+
+# ---------------------------------------------------------------------------
+# Targets deleted mid-round
+# ---------------------------------------------------------------------------
+class TestDropMissingTargets:
+    def _batch(self, target_ids):
+        check_rows = [
+            dict(_check_result(tid), **{}) for tid in target_ids
+        ]
+        for row in check_rows:
+            row.pop("dns_server", None)
+        status_rows = {
+            tid: _build_status_values(_check_result(tid), None, None) for tid in target_ids
+        }
+        return check_rows, status_rows
+
+    def test_deleted_target_is_dropped_and_the_rest_survive(self):
+        # Arrange: a batch of 3, where target 2 was deleted mid-round
+        check_rows, status_rows = self._batch([1, 2, 3])
+
+        # Act
+        kept_checks, kept_status = _drop_missing_targets(check_rows, status_rows, {1, 3})
+
+        # Assert: the deleted one is gone, the other two are untouched
+        assert [r["target_id"] for r in kept_checks] == [1, 3]
+        assert set(kept_status) == {1, 3}
+
+    def test_whole_batch_dropped_when_every_target_is_gone(self):
+        check_rows, status_rows = self._batch([1, 2])
+        kept_checks, kept_status = _drop_missing_targets(check_rows, status_rows, set())
+        assert kept_checks == []
+        assert kept_status == {}
+
+    def test_nothing_dropped_when_all_targets_are_alive(self):
+        check_rows, status_rows = self._batch([1, 2, 3])
+        kept_checks, kept_status = _drop_missing_targets(check_rows, status_rows, {1, 2, 3})
+        assert len(kept_checks) == 3
+        assert set(kept_status) == {1, 2, 3}
+
+    def test_orphan_check_results_are_not_written_either(self):
+        # check_results has no foreign key, so orphan rows would insert happily
+        # and linger after the target's history was deleted.
+        check_rows, status_rows = self._batch([7, 8])
+        kept_checks, _ = _drop_missing_targets(check_rows, status_rows, {7})
+        assert [r["target_id"] for r in kept_checks] == [7]
 
 
 # ---------------------------------------------------------------------------

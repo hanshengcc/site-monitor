@@ -10,6 +10,7 @@ from loguru import logger
 from sqlalchemy import case, func, select, text
 from sqlalchemy import insert as sa_insert
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import IntegrityError
 
 from backend.app.config import settings
 from backend.app.database import AsyncSessionLocal
@@ -433,52 +434,100 @@ async def _open_http_error_anomalies(session, failing: list[tuple[dict, int]]):
         await session.execute(sa_insert(Anomaly), new_anomalies)
 
 
+async def _surviving_target_ids(session, target_ids) -> set[int]:
+    """Subset of target_ids that still exist in the targets table."""
+    return set((await session.execute(
+        select(Target.id).where(Target.id.in_(list(target_ids)))
+    )).scalars().all())
+
+
+async def _write_batch(session, check_rows: list[dict], status_rows: dict[int, dict]):
+    """Persist one pre-filtered batch. Caller owns the transaction."""
+    if not status_rows:
+        return
+
+    await session.execute(sa_insert(CheckResult), check_rows)
+
+    result = await session.execute(_status_upsert_statement(list(status_rows.values())))
+    fails_by_target = dict(result.all())
+
+    recovered = [
+        (values["target_id"], values["last_check_at"])
+        for values in status_rows.values() if values["is_ok"]
+    ]
+    failing = [
+        (values, fails_by_target.get(values["target_id"], 1))
+        for values in status_rows.values() if not values["is_ok"]
+    ]
+    failing = [
+        (values, fails) for values, fails in failing
+        if fails >= settings.consecutive_fails_threshold
+    ]
+
+    await _resolve_open_anomalies(session, recovered)
+    await _open_http_error_anomalies(session, failing)
+
+
+def _drop_missing_targets(check_rows: list[dict], status_rows: dict[int, dict], alive: set[int]):
+    """Keep only the rows whose target still exists."""
+    return (
+        [row for row in check_rows if row["target_id"] in alive],
+        {tid: values for tid, values in status_rows.items() if tid in alive},
+    )
+
+
 async def _flush_buffer(buffer: list):
     """Write a batch of results to DB using a handful of set-based statements.
 
     The previous implementation issued three or more round trips per result, which
     at tens of thousands of targets per round dominated the check duration. This
     version costs a fixed number of statements per batch regardless of batch size.
+
+    Targets deleted mid-round are dropped from the batch first. Without that, a
+    single deleted target makes target_status violate its foreign key and takes
+    the whole batch of unrelated results down with it — deleting a group while a
+    round is in flight used to lose results for thousands of live targets.
     """
     if not buffer:
         return
+
+    check_rows: list[dict] = []
+    # Last reading wins if a target somehow appears twice: PostgreSQL rejects an
+    # ON CONFLICT DO UPDATE that would touch the same row twice in one statement.
+    status_rows: dict[int, dict] = {}
+
+    for r in buffer:
+        ssl_info = r.pop("ssl_info", None)
+        dns_server = r.pop("dns_server", None)
+        check_rows.append(dict(r))
+        status_rows[r["target_id"]] = _build_status_values(r, dns_server, ssl_info)
+
     try:
-        check_rows: list[dict] = []
-        # Last reading wins if a target somehow appears twice: PostgreSQL rejects an
-        # ON CONFLICT DO UPDATE that would touch the same row twice in one statement.
-        status_rows: dict[int, dict] = {}
-
-        for r in buffer:
-            ssl_info = r.pop("ssl_info", None)
-            dns_server = r.pop("dns_server", None)
-            check_rows.append(dict(r))
-            status_rows[r["target_id"]] = _build_status_values(r, dns_server, ssl_info)
-
         async with AsyncSessionLocal() as session:
-            await session.execute(sa_insert(CheckResult), check_rows)
-
-            result = await session.execute(_status_upsert_statement(list(status_rows.values())))
-            fails_by_target = dict(result.all())
-
-            recovered = [
-                (values["target_id"], values["last_check_at"])
-                for values in status_rows.values() if values["is_ok"]
-            ]
-            failing = [
-                (values, fails_by_target.get(values["target_id"], 1))
-                for values in status_rows.values() if not values["is_ok"]
-            ]
-            failing = [
-                (values, fails) for values, fails in failing
-                if fails >= settings.consecutive_fails_threshold
-            ]
-
-            await _resolve_open_anomalies(session, recovered)
-            await _open_http_error_anomalies(session, failing)
-
+            alive = await _surviving_target_ids(session, status_rows)
+            check_rows, status_rows = _drop_missing_targets(check_rows, status_rows, alive)
+            await _write_batch(session, check_rows, status_rows)
             await session.commit()
+        return
+    except IntegrityError:
+        # A delete committed between the existence check and the write. Re-read
+        # the survivors and retry once; anything still failing is a real error.
+        logger.warning(
+            f"Batch of {len(buffer)} results hit a foreign key race "
+            f"(targets deleted mid-flush), retrying with the survivors."
+        )
     except Exception as e:
         logger.error(f"DB flush failed for {len(buffer)} results: {e}")
+        return
+
+    try:
+        async with AsyncSessionLocal() as session:
+            alive = await _surviving_target_ids(session, status_rows)
+            check_rows, status_rows = _drop_missing_targets(check_rows, status_rows, alive)
+            await _write_batch(session, check_rows, status_rows)
+            await session.commit()
+    except Exception as e:
+        logger.error(f"DB flush retry failed for {len(buffer)} results: {e}")
 
 
 from collections import defaultdict, deque
