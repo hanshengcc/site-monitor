@@ -114,3 +114,7 @@ cd frontend && npm run dev
 | 2万域名截图 | ~3 小时/轮（8并发）|
 | 单日存储（2万×1次截图）| ~2GB |
 | 推荐服务器 | 8C16G |
+
+## License
+
+MIT，见 [LICENSE](LICENSE)。
